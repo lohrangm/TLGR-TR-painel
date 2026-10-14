@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gestor TLGR - Painel
 // @namespace    telegram-top-reacoes
-// @version      2026.10.13.2
+// @version      2026.10.14.4
 // @description  Login e scanner de reacoes, busca de grupos/canais e mais, tudo direto dentro do Telegram Web, sem servidor local - cliente MTProto rodando em JS puro no proprio navegador
 // @match        https://web.telegram.org/*
 // @grant        GM_setValue
@@ -134625,10 +134625,10 @@ ${host}`;
           if (/\//.test(address)) {
             throw new address_error_1.AddressError("Invalid subnet mask.");
           }
-          const zone = constants6.RE_ZONE_STRING.exec(address);
-          if (zone) {
-            this.zone = zone[0];
-            address = address.replace(constants6.RE_ZONE_STRING, "");
+          const zoneStart = address.indexOf("%");
+          if (zoneStart !== -1 && /^.*$/.test(address.slice(zoneStart))) {
+            this.zone = address.slice(zoneStart);
+            address = address.slice(0, zoneStart);
           }
           const longest = this.groups * 5 + 5;
           if (address.length > longest) {
@@ -169484,7 +169484,7 @@ store2/dist/store2.js:
   * Copyright (c) 2024 Nathan Bubna; Licensed MIT *)
 */
 
-window.TRP_VERSAO = "2026.10.13.2";
+window.TRP_VERSAO = "2026.10.14.4";
 
 // ==== FIM DO BUNDLE DO TELEPROTO - A PARTIR DAQUI E painel_logic.js ====
 
@@ -169603,6 +169603,7 @@ window.TRP_VERSAO = "2026.10.13.2";
 
     let cliente = null; // instancia conectada, reaproveitada entre aberturas do painel
     let painel = null;
+    let botaoFlutuante = null; // o "Gestor TLGR" fixo na pagina (mostra o numero de novas dos Monitorados)
     let areaRolavel = null; // unico filho de painel que de fato rola - ver montarPainel()
     let bancoPromessa = null;
     let pastaDeArmazenamento = null; // FileSystemDirectoryHandle confirmado NESTA sessao (ver garantirPastaDeArmazenamento)
@@ -169646,6 +169647,7 @@ window.TRP_VERSAO = "2026.10.13.2";
             await visualizacaoScanAtiva.aoTerminarScan();
         }
     }
+    let dadosDaContaEmCache = null; // { cliente, eu } - ver telaLogado
     let saidaPendente = false; // true = usuario ja clicou "sair" uma vez, espera o segundo clique pra confirmar
     let timeoutSaida = null;
 
@@ -169702,7 +169704,13 @@ window.TRP_VERSAO = "2026.10.13.2";
 
     const filaDeEscrita = new Map(); // caminho relativo (string) -> promessa da ultima escrita ja enfileirada nesse caminho
 
+    // Quantas escritas ja foram pedidas por caminho (so cresce) - usado pela
+    // compactacao pra saber se alguma escrita comecou depois que ela leu o
+    // arquivo (ver compactarArquivoSeValerAPena).
+    const escritasPedidasPorCaminho = new Map();
+
     function enfileirarEscrita(caminho, tarefa) {
+        escritasPedidasPorCaminho.set(caminho, (escritasPedidasPorCaminho.get(caminho) || 0) + 1);
         const anterior = filaDeEscrita.get(caminho) || Promise.resolve();
         const atual = anterior.then(tarefa, tarefa); // roda mesmo se a anterior falhou - um arquivo com problema nao trava os outros pra sempre
         filaDeEscrita.set(
@@ -169760,9 +169768,11 @@ window.TRP_VERSAO = "2026.10.13.2";
     // a leitura do arquivo inteiro.
     function repetirJsonlUltimaVence(texto, nomeDaChave) {
         const porChave = new Map();
+        porChave.linhasLidas = 0;
         if (texto) {
             for (const linha of texto.split("\n")) {
                 if (!linha.trim()) continue;
+                porChave.linhasLidas++;
                 try {
                     const registro = JSON.parse(linha);
                     porChave.set(registro[nomeDaChave], registro);
@@ -169772,6 +169782,30 @@ window.TRP_VERSAO = "2026.10.13.2";
             }
         }
         return porChave;
+    }
+
+    // Reescreve um .jsonl so com a ultima versao de cada chave quando ele
+    // tem muitas linhas repetidas (cada reescaneamento e cada "visto"
+    // acrescenta uma linha nova pra mesma mensagem, e nada nunca apagava as
+    // antigas). Arquivo menor = abre mais rapido e cada anexo copia menos
+    // (ver "Gravacao em lote"). Seguro contra perder linha: so compacta se
+    // nenhuma escrita nesse arquivo foi pedida desde a leitura
+    // (escritasPedidasAntes) e se nao ha linha pendente pra ele; a
+    // reescrita entra na fila do arquivo, entao qualquer anexo pedido
+    // depois vai pro arquivo ja compactado. createWritable so troca o
+    // arquivo no close(): se o navegador fechar no meio, o antigo fica.
+    const MINIMO_LINHAS_PARA_COMPACTAR = 20000;
+    function compactarArquivoSeValerAPena(db, caminho, mapa, escritasPedidasAntes) {
+        const linhas = mapa.linhasLidas || 0;
+        if (linhas < MINIMO_LINHAS_PARA_COMPACTAR || linhas < mapa.size * 1.5) return null;
+        if ((escritasPedidasPorCaminho.get(caminho) || 0) !== escritasPedidasAntes) return null;
+        if (db.escritasPendentes && db.escritasPendentes.get(caminho)) return null;
+        const partes = [];
+        for (const registro of mapa.values()) partes.push(JSON.stringify(registro));
+        console.log("[Gestor TLGR] compactando", caminho, "de", linhas, "pra", mapa.size, "linhas");
+        return sobrescreverArquivoTexto(db.pasta, caminho, partes.join("\n") + "\n").catch((erro) =>
+            console.warn("[Gestor TLGR] erro ao compactar " + caminho, erro)
+        );
     }
 
     // ---- Escolha/permissao da pasta (config minuscula, IndexedDB) ----
@@ -169790,25 +169824,33 @@ window.TRP_VERSAO = "2026.10.13.2";
         });
     }
 
-    async function lerPastaSalva() {
+    // Handles de pasta guardados no banco de config: "pastaArmazenamento"
+    // (pasta de dados) e, desde a rodada 4, "pastaDownloads" (pasta
+    // opcional so pros arquivos baixados - Configuracoes > Downloads).
+    async function lerHandleSalvo(chave) {
         const dbConfig = await abrirBancoConfig();
         return new Promise((resolve, reject) => {
-            const pedido = dbConfig.transaction("config", "readonly").objectStore("config").get("pastaArmazenamento");
+            const pedido = dbConfig.transaction("config", "readonly").objectStore("config").get(chave);
             pedido.onsuccess = () => resolve(pedido.result ? pedido.result.handle : null);
             pedido.onerror = () => reject(pedido.error);
         });
     }
 
-    async function salvarPastaEscolhida(handle) {
+    async function salvarHandle(chave, handle) {
         const dbConfig = await abrirBancoConfig();
         return new Promise((resolve, reject) => {
-            const pedido = dbConfig
-                .transaction("config", "readwrite")
-                .objectStore("config")
-                .put({ chave: "pastaArmazenamento", handle });
+            const pedido = dbConfig.transaction("config", "readwrite").objectStore("config").put({ chave, handle });
             pedido.onsuccess = () => resolve();
             pedido.onerror = () => reject(pedido.error);
         });
+    }
+
+    function lerPastaSalva() {
+        return lerHandleSalvo("pastaArmazenamento");
+    }
+
+    function salvarPastaEscolhida(handle) {
+        return salvarHandle("pastaArmazenamento", handle);
     }
 
     // Confere se ja temos uma pasta de verdade, com permissao de
@@ -169882,11 +169924,104 @@ window.TRP_VERSAO = "2026.10.13.2";
                     // chats.json corrompido/vazio - comeca do zero em vez de travar o painel inteiro
                 }
             }
+            const escritasNoIndiceAntes = escritasPedidasPorCaminho.get("indice.jsonl") || 0;
             const textoIndice = await lerArquivoTexto(pasta, "indice.jsonl");
             const indice = repetirJsonlUltimaVence(textoIndice, "key");
-            return { pasta, chats, indice, textoCompletoPorChat: new Map() };
+            const contagemPorChat = new Map(); // chatId -> mensagens no indice (mantido em salvarMensagem)
+            for (const registro of indice.values()) {
+                contagemPorChat.set(registro.chatId, (contagemPorChat.get(registro.chatId) || 0) + 1);
+            }
+            const remetentes = new Map();
+            const textoRemetentes = await lerArquivoTexto(pasta, "remetentes.json").catch(() => null);
+            if (textoRemetentes) {
+                try {
+                    for (const [id, dados] of Object.entries(JSON.parse(textoRemetentes))) remetentes.set(id, dados);
+                } catch (erro) {
+                    // corrompido: recomeca (so nomes, o scan preenche de novo)
+                }
+            }
+            const db = {
+                pasta,
+                chats,
+                indice,
+                remetentes,
+                contagemPorChat,
+                textoCompletoPorChat: new Map(),
+                escritasPendentes: new Map(),
+                linhasPendentes: 0,
+            };
+            db.compactacaoDoIndice = compactarArquivoSeValerAPena(db, "indice.jsonl", indice, escritasNoIndiceAntes);
+            await carregarFavoritos(db); // ehFavorito() e sincrono nas listas
+            await carregarMonitorados(db); // estaMonitorado() tambem
+            return db;
         })();
         return bancoPromessa;
+    }
+
+    // ---- Gravacao em lote (scan e importacao de backup) ----
+    //
+    // Medido num Chromium real (Playwright + OPFS, mesma API de arquivo que
+    // a pasta escolhida usa): createWritable({keepExistingData: true}) faz o
+    // navegador COPIAR o arquivo inteiro pra um arquivo temporario (.crswap)
+    // antes de cada escrita - anexar 1 linha num arquivo de 20 MB levou
+    // ~130 ms, de 100 MB ~600 ms, de 200 MB ~1,2 s. Antes, o scan anexava
+    // 2 linhas POR MENSAGEM (indice.jsonl + mensagens/<chat>.jsonl), entao
+    // o custo de cada mensagem crescia junto com o tamanho do indice - o
+    // scan ficava cada vez mais lento, ate parecer travado. Ver
+    // HISTORICO_TECNICO.md (auditoria 2026-10).
+    //
+    // Agora o scan e a importacao juntam as linhas em memoria
+    // (db.escritasPendentes, caminho -> lista de linhas) e gravam tudo de
+    // uma vez em descarregarEscritasPendentes(): 1 copia por arquivo a cada
+    // checkpoint (INTERVALO_CHECKPOINT_SCAN mensagens), nao 1 por mensagem.
+    //
+    // Regra que mantem o checkpoint consistente: o checkpoint de um chat
+    // (lastScannedMessageId/textoCompletoAte em chats.json) so e gravado
+    // DEPOIS de descarregar as mensagens pendentes (ver salvarCheckpoint em
+    // escanearTudo). Se o navegador fechar no meio, o que estava pendente
+    // se perde, mas o checkpoint tambem nao avancou - o proximo scan pega
+    // essas mensagens de novo ("ultima linha vence" torna isso inofensivo).
+    const LIMITE_LINHAS_PENDENTES = 10000; // teto de memoria: descarrega sozinho se passar disso entre checkpoints (scan faz checkpoint a cada 2000 mensagens = 4000 linhas)
+
+    function adiarAnexo(db, caminho, linha) {
+        let linhas = db.escritasPendentes.get(caminho);
+        if (!linhas) {
+            linhas = [];
+            db.escritasPendentes.set(caminho, linhas);
+        }
+        linhas.push(linha);
+        db.linhasPendentes++;
+    }
+
+    // Grava tudo que esta pendente. Troca o Map ANTES de gravar, pra uma
+    // mensagem salva durante a gravacao entrar no proximo lote, nunca se
+    // perder. A ordem por caminho e preservada pela fila de
+    // enfileirarEscrita (o lote entra na fila antes de qualquer escrita
+    // pedida depois dele).
+    async function descarregarEscritasPendentes(db) {
+        if (db.remetentesMudou) {
+            db.remetentesMudou = false;
+            // Outra aba pode ter gravado nomes que esta nao conhece: junta
+            // antes de regravar (o desta aba vence, e o mais recente aqui).
+            try {
+                const doDisco = JSON.parse((await lerArquivoTexto(db.pasta, "remetentes.json")) || "{}");
+                for (const [id, dados] of Object.entries(doDisco)) if (!db.remetentes.has(id)) db.remetentes.set(id, dados);
+            } catch (erro) {
+                // arquivo corrompido: regrava so o desta aba
+            }
+            const conteudo = JSON.stringify(Object.fromEntries(db.remetentes));
+            await sobrescreverArquivoTexto(db.pasta, "remetentes.json", conteudo).catch((erro) => {
+                db.remetentesMudou = true;
+                console.warn("[Gestor TLGR] remetentes.json:", erro);
+            });
+        }
+        if (!db.escritasPendentes || !db.escritasPendentes.size) return;
+        const lote = db.escritasPendentes;
+        db.escritasPendentes = new Map();
+        db.linhasPendentes = 0;
+        await Promise.all(
+            [...lote].map(([caminho, linhas]) => anexarArquivoTexto(db.pasta, caminho, linhas.join("")))
+        );
     }
 
     async function persistirChats(db) {
@@ -169908,15 +170043,23 @@ window.TRP_VERSAO = "2026.10.13.2";
 
     // So os campos leves, sem "texto" nem "reactions" - o que vai pro
     // indice.jsonl (carregado inteiro em memoria, precisa ficar pequeno).
+    // Excecao (rodada 4): mensagem COM reacao leva um trecho curto do texto
+    // ("trecho", 100 caracteres) - Top reacoes e Minhas reacoes so leem o
+    // indice e, desde a troca pro disco, mostravam a mensagem sem texto
+    // nenhum. Mensagem com reacao e minoria, entao o indice cresce pouco;
+    // as outras tem o texto lido do arquivo do chat so quando aparecem na
+    // tela (preencherTrechosQueFaltam).
+    const TAMANHO_TRECHO_NO_INDICE = 100;
     function registroLeve(registro) {
-        const { texto, reactions, ...leve } = registro;
+        const { texto, reactions, trecho, ...leve } = registro;
+        if ((registro.reactionTotal || 0) > 0 && texto) leve.trecho = texto.slice(0, TAMANHO_TRECHO_NO_INDICE);
         return leve;
     }
 
     // Conjunto de chatId que tem algum dado salvo - usado por
-    // buscarTexto/listarTodasMensagens pra decidir quais chats varrer.
+    // buscarTexto/gerarPedacosDoBackup pra decidir quais chats varrer.
     // NAO basta usar so db.chats.keys(): "chats" so e persistido no
-    // primeiro checkpoint do scan (salvarCheckpoint, a cada 500 mensagens
+    // primeiro checkpoint do scan (salvarCheckpoint, a cada INTERVALO_CHECKPOINT_SCAN mensagens
     // OU no fim de uma fase - ver escanearTudo), enquanto o indice e
     // atualizado a CADA mensagem salva (salvarMensagem). Um chat novo, nos
     // primeiros segundos de um scan em andamento, ja tem mensagens no
@@ -169927,24 +170070,57 @@ window.TRP_VERSAO = "2026.10.13.2";
     // depender da store de chats).
     function idsDeChatsComDados(db) {
         const ids = new Set(db.chats.keys());
-        for (const registro of db.indice.values()) ids.add(registro.chatId);
+        for (const chatId of db.contagemPorChat.keys()) ids.add(chatId);
         return ids;
     }
 
     // Le (do cache em memoria, se ja carregado; senao do disco, 1x) o Map
     // completo de mensagens (com "texto") de UM chat especifico. Usado por
-    // buscarTexto/buscarMensagem/listarTodasMensagens - nunca por
+    // buscarTexto/buscarMensagem - nunca por
     // buscarTop/buscarTopPorData, que resolvem tudo so com o indice leve.
+    // Cache com teto de memoria: guarda o texto completo dos chats lidos
+    // ate somar LIMITE_CACHE_TEXTO_CARACTERES de JSON lido do disco; passou
+    // disso, descarta o chat usado ha mais tempo (ordem do Map = ordem de
+    // uso, cada acesso move o chat pro fim). Antes ou guardava tudo pra
+    // sempre (risco de estourar a memoria em "Todos os grupos") ou, depois
+    // da auditoria anterior, nao guardava nada em "Todos" (cada busca relia
+    // GBs do disco).
+    const LIMITE_CACHE_TEXTO_CARACTERES = 150 * 1000 * 1000;
     async function obterMensagensCompletasDoChat(db, chatId) {
-        if (db.textoCompletoPorChat.has(chatId)) return db.textoCompletoPorChat.get(chatId);
-        const texto = await lerArquivoTexto(db.pasta, "mensagens/" + chatId + ".jsonl");
-        const mapa = repetirJsonlUltimaVence(texto, "key");
+        const emCache = db.textoCompletoPorChat.get(chatId);
+        if (emCache) {
+            db.textoCompletoPorChat.delete(chatId);
+            db.textoCompletoPorChat.set(chatId, emCache);
+            return emCache;
+        }
+        const mapa = await lerMensagensDoChatSemCache(db, chatId);
         db.textoCompletoPorChat.set(chatId, mapa);
+        db.caracteresEmCache = (db.caracteresEmCache || 0) + mapa.caracteresLidos;
+        for (const [idAntigo, mapaAntigo] of db.textoCompletoPorChat) {
+            if (db.caracteresEmCache <= (db.limiteCacheTexto || LIMITE_CACHE_TEXTO_CARACTERES) || idAntigo === chatId) break;
+            db.textoCompletoPorChat.delete(idAntigo);
+            db.caracteresEmCache -= mapaAntigo.caracteresLidos;
+        }
+        return mapa;
+    }
+
+    // Le o arquivo do chat e aplica por cima as linhas ainda pendentes de
+    // gravacao (ver "Gravacao em lote") - sem isso, abrir uma busca durante
+    // um scan deixaria de fora as ultimas mensagens ainda nao gravadas.
+    async function lerMensagensDoChatSemCache(db, chatId) {
+        const caminho = "mensagens/" + chatId + ".jsonl";
+        const escritasAntes = escritasPedidasPorCaminho.get(caminho) || 0;
+        const texto = await lerArquivoTexto(db.pasta, caminho);
+        const pendentes = db.escritasPendentes && db.escritasPendentes.get(caminho);
+        const conteudo = pendentes ? (texto || "") + pendentes.join("") : texto;
+        const mapa = repetirJsonlUltimaVence(conteudo, "key");
+        mapa.caracteresLidos = conteudo ? conteudo.length : 0;
+        if (!pendentes) compactarArquivoSeValerAPena(db, caminho, mapa, escritasAntes);
         return mapa;
     }
 
     // Busca uma mensagem especifica pela chave (chatId:messageId) - usado
-    // pela tela "Verificar mensagem" pra checar se algo que apareceu na
+    // pela conferencia de link da Busca avancada pra checar se algo que apareceu na
     // busca nativa do Telegram esta (ou nao) no nosso banco local. O
     // chatId nunca tem ":" (ver idBaseDoChatId), entao cortar no ULTIMO
     // ":" da chave sempre isola o chatId certo.
@@ -169954,53 +170130,234 @@ window.TRP_VERSAO = "2026.10.13.2";
         return mapa.get(key) || null;
     }
 
-    // Todas as mensagens salvas, de todos os chats - usado so pelo backup
-    // (telaBackup()), nunca pelas telas do dia-a-dia. Le o arquivo
-    // completo de CADA chat (o unico jeito de ter o "texto" de tudo) -
-    // pode ser pesado (a mesma razao pela qual o armazenamento inteiro
-    // existe), mas so roda quando o usuario pede um export, nao em
-    // background.
-    async function listarTodasMensagens(db) {
-        const todas = [];
-        for (const chatId of idsDeChatsComDados(db)) {
-            const mapa = await obterMensagensCompletasDoChat(db, chatId);
-            todas.push(...mapa.values());
+    // Monta o backup em PEDACOS (um por chat) em vez de um objeto unico
+    // passado pro JSON.stringify: antes o texto de todas as mensagens
+    // virava uma string so na memoria, o que com historico grande passa
+    // do limite de tamanho de string do navegador. Com
+    // showSaveFilePicker (Chrome/Edge) cada pedaco vai direto pro arquivo
+    // escolhido; sem ele, os pedacos viram um Blob (sem juntar numa
+    // string). O formato do arquivo e o mesmo de antes.
+    async function gerarPedacosDoBackup(db, aoGerarPedaco, aoProgresso) {
+        const chats = listarChats(db);
+        await aoGerarPedaco(
+            '{"formato":"gestor-tlgr-backup","versaoApp":' +
+                JSON.stringify(VERSAO_PAINEL) +
+                ',"geradoEm":' +
+                JSON.stringify(new Date().toISOString()) +
+                ',"chats":' +
+                JSON.stringify(chats) +
+                ',"mensagens":['
+        );
+        let totalMensagens = 0;
+        let primeiro = true;
+        const idsDosChats = [...idsDeChatsComDados(db)];
+        for (let i = 0; i < idsDosChats.length; i++) {
+            if (aoProgresso) aoProgresso(`Exportando grupo ${i + 1} de ${idsDosChats.length}...`);
+            const mapa = await lerMensagensDoChatSemCache(db, idsDosChats[i]);
+            const linhas = [];
+            for (const registro of mapa.values()) linhas.push(JSON.stringify(comVistoDoIndice(db, registro)));
+            if (!linhas.length) continue;
+            await aoGerarPedaco((primeiro ? "" : ",") + linhas.join(","));
+            primeiro = false;
+            totalMensagens += linhas.length;
         }
-        return todas;
+        await aoGerarPedaco("]}");
+        return { totalChats: chats.length, totalMensagens };
     }
 
-    async function salvarMensagem(db, registro) {
+    // opcoes.adiarGravacao = true: so guarda a linha em memoria (ver
+    // "Gravacao em lote" acima) - quem passa isso (scan, importacao) tem
+    // que chamar descarregarEscritasPendentes() depois. Sem a opcao, grava
+    // na hora (marcar visto, busca ao vivo), descarregando junto qualquer
+    // lote pendente pra manter a ordem das linhas no arquivo.
+    // Quem quer saber de mensagem que acabou de entrar no banco (scan,
+    // busca ao vivo, Monitorados) se registra aqui: (db, registro) -> nada.
+    // So mensagem NOVA (que nao estava no indice) - rescanear nao repete.
+    const aoSalvarMensagemNova = [];
+
+    async function salvarMensagem(db, registro, opcoes) {
         const leve = registroLeve(registro);
+        const eraNova = !db.indice.has(registro.key);
+        if (eraNova) {
+            db.contagemPorChat.set(registro.chatId, (db.contagemPorChat.get(registro.chatId) || 0) + 1);
+        }
         db.indice.set(registro.key, leve);
+        if (eraNova) {
+            for (const avisar of aoSalvarMensagemNova) {
+                try {
+                    avisar(db, registro);
+                } catch (erro) {
+                    console.warn("[Gestor TLGR] aviso de mensagem nova:", erro);
+                }
+            }
+        }
         const cacheDoChat = db.textoCompletoPorChat.get(registro.chatId);
         if (cacheDoChat) cacheDoChat.set(registro.key, registro); // mantem o cache (se ja carregado) atualizado, nunca deixa ele ficar velho
-        await Promise.all([
-            anexarArquivoTexto(db.pasta, "mensagens/" + registro.chatId + ".jsonl", JSON.stringify(registro) + "\n"),
-            anexarArquivoTexto(db.pasta, "indice.jsonl", JSON.stringify(leve) + "\n"),
-        ]);
+        adiarAnexo(db, "mensagens/" + registro.chatId + ".jsonl", JSON.stringify(registro) + "\n");
+        adiarAnexo(db, "indice.jsonl", JSON.stringify(leve) + "\n");
+        if (!(opcoes && opcoes.adiarGravacao) || db.linhasPendentes >= LIMITE_LINHAS_PENDENTES) {
+            await descarregarEscritasPendentes(db);
+        }
+    }
+
+    // Monta o registro de uma mensagem vinda do scan. "visto" e um campo so
+    // nosso (marcado a mao pelo usuario) que o Telegram nao manda - sem
+    // copiar ele do registro anterior, reescanear (forcar reescaneamento,
+    // backfill) apagava todas as marcacoes de "ja visto" daquele chat.
+    function montarRegistroDoScan(db, chatId, chatTitle, mensagem) {
+        const key = chatId + ":" + mensagem.id;
+        const registro = {
+            key,
+            chatId,
+            messageId: mensagem.id,
+            dateUtc: dataIso(mensagem),
+            texto: textoCompleto(mensagem),
+            chatTitle,
+        };
+        aplicarDadosDaMensagem(registro, mensagem);
+        registrarRemetente(db, mensagem);
+        const anterior = db.indice.get(key);
+        if (anterior && anterior.visto) registro.visto = true;
+        return registro;
+    }
+
+    // Campos que vem da mensagem do Telegram e vao pro indice leve (rodada
+    // 4): autor ("de", id no formato da Bot API: pessoa = numero positivo,
+    // canal/grupo = -100...), resumo das reacoes por emoji (pra mostrar e
+    // filtrar sem ler o arquivo do chat), tipo de midia, se o texto cita
+    // link e a assinatura do post (canal, admin anonimo). Mensagem salva
+    // antes desta versao nao tem esses campos ate ser escaneada de novo (ou
+    // atualizada pelo servidor - "Atualizar reacoes" / Monitorados).
+    // Usado pelo scan e por todo lugar que salva mensagem vinda do servidor.
+    function aplicarDadosDaMensagem(registro, mensagem) {
+        const { reactions, total, minhasReacoes } = extrairReacoes(mensagem);
+        registro.reactionTotal = total;
+        registro.reactions = reactions;
+        registro.minhasReacoes = minhasReacoes;
+        if (reactions.length) registro.emojis = reactions.map((r) => [r.emoji, r.count]);
+        else delete registro.emojis;
+        const de = idDoAutor(mensagem);
+        if (de) registro.de = de;
+        const tipo = typeof tipoDaMidia === "function" ? tipoDaMidia(mensagem) : null;
+        if (tipo) registro.midia = tipo;
+        else delete registro.midia;
+        if (REGEX_TEM_LINK.test(mensagem.message || "")) registro.link = true;
+        else delete registro.link;
+        if (mensagem.postAuthor) registro.assinatura = String(mensagem.postAuthor).slice(0, 64);
+        return registro;
+    }
+
+    // Id do autor no formato da Bot API (o mesmo do chatId): pessoa =
+    // "123", canal/supergrupo = "-100123", grupo basico = "-123". O
+    // teleproto ja calcula isso em mensagem.senderId (from_id; em post de
+    // canal, o proprio canal). Sem teleproto (objeto cru da API), olha o
+    // fromId.
+    function idDoAutor(mensagem) {
+        if (mensagem.senderId != null) return String(mensagem.senderId);
+        const de = mensagem.fromId;
+        if (!de) return null;
+        if (de.userId != null) return String(de.userId);
+        if (de.channelId != null) return "-100" + String(de.channelId);
+        if (de.chatId != null) return "-" + String(de.chatId);
+        return null;
+    }
+
+    // Nome atual de quem mandou (pessoa ou canal), guardado em
+    // remetentes.json na pasta (id -> { n: nome, u: @usuario, c: canal?,
+    // h: access hash quando o Telegram manda um completo, a: nomes
+    // anteriores }). Serve pra achar a pessoa pelo nome (Monitorados) e
+    // mostrar o nome atual sem pedir nada ao Telegram. Gravado junto com o
+    // lote de mensagens (descarregarEscritasPendentes), so quando mudou.
+    function registrarRemetente(db, mensagem) {
+        const entidade = mensagem.sender || mensagem._sender;
+        const de = idDoAutor(mensagem);
+        if (!de || !entidade || !db.remetentes) return;
+        atualizarRemetente(db, de, entidade);
+    }
+
+    function nomeDaEntidade(entidade) {
+        if (!entidade) return "";
+        if (entidade.title) return String(entidade.title);
+        return [entidade.firstName, entidade.lastName].filter(Boolean).join(" ").trim() || (entidade.deleted ? "(conta apagada)" : "(sem nome)");
+    }
+
+    function atualizarRemetente(db, id, entidade) {
+        const anterior = db.remetentes.get(id);
+        const nome = nomeDaEntidade(entidade);
+        const usuario = entidade.username || (entidade.usernames && entidade.usernames[0] && entidade.usernames[0].username) || "";
+        const ehCanal = entidade.className === "Channel" || entidade.className === "Chat" || !!entidade.title;
+        const hash = !entidade.min && entidade.accessHash != null ? String(entidade.accessHash) : null;
+        if (anterior && anterior.n === nome && (anterior.u || "") === usuario && (!hash || anterior.h === hash)) return;
+        const novo = { n: nome };
+        if (usuario) novo.u = usuario;
+        if (ehCanal) novo.c = true;
+        if (hash) novo.h = hash;
+        else if (anterior && anterior.h) novo.h = anterior.h;
+        const anteriores = (anterior && anterior.a) || [];
+        if (anterior && anterior.n && anterior.n !== nome) novo.a = [anterior.n, ...anteriores.filter((n) => n !== anterior.n && n !== nome)].slice(0, 5);
+        else if (anteriores.length) novo.a = anteriores;
+        db.remetentes.set(id, novo);
+        db.remetentesMudou = true;
     }
 
     // Marca (ou desmarca) uma mensagem como "ja vista" - controle 100%
-    // manual do usuario (nao e automatico, nao expira, nao tem logica por
-    // tras). Usado pela caixinha em cada item das listas de resultado (top
-    // reacoes e busca). Reaproveita salvarMensagem() (acrescenta uma nova
-    // "versao" da mensagem com visto atualizado) - mesma semantica do
-    // put() antigo, so que como uma linha nova em vez de edicao no lugar.
+    // manual do usuario. Grava SO no indice leve (uma linha pequena em
+    // indice.jsonl): antes lia o arquivo inteiro do chat (pode ter centenas
+    // de MB) so pra regravar a mensagem completa com um campo a mais. O
+    // indice passa a ser a fonte da verdade do "visto" - quem le mensagem
+    // completa do arquivo do chat (buscarTexto, backup) aplica o "visto" do
+    // indice por cima (comVistoDoIndice).
     async function marcarVisto(db, key, visto) {
-        const registro = await buscarMensagem(db, key);
-        if (!registro) return;
-        await salvarMensagem(db, { ...registro, visto });
+        const leve = db.indice.get(key);
+        if (!leve) return;
+        const novo = { ...leve, visto };
+        db.indice.set(key, novo);
+        const cacheDoChat = db.textoCompletoPorChat.get(leve.chatId);
+        const completo = cacheDoChat && cacheDoChat.get(key);
+        if (completo) cacheDoChat.set(key, { ...completo, visto });
+        adiarAnexo(db, "indice.jsonl", JSON.stringify(novo) + "\n");
+        await descarregarEscritasPendentes(db);
     }
 
-    // Conta quantas mensagens com reacao ja estao salvas de um chat - usado
-    // pra mostrar "o que ja foi salvo". So precisa do indice leve (ja em
-    // memoria), nunca le nada do disco.
-    function contarMensagensDoChat(db, chatId) {
-        let total = 0;
-        for (const registro of db.indice.values()) {
-            if (registro.chatId === chatId) total++;
+    // O indice e a fonte da verdade dos campos que mudam depois do scan:
+    // "visto" (marcado a mao) e as reacoes atualizadas pelo servidor
+    // ("Atualizar reacoes", Monitorados) - quem le a mensagem completa do
+    // arquivo do chat (busca, backup) aplica esses campos por cima.
+    const CAMPOS_DO_INDICE_QUE_VENCEM = ["reactionTotal", "minhasReacoes", "emojis", "de", "midia", "link", "assinatura"];
+    function comVistoDoIndice(db, registro) {
+        const leve = db.indice.get(registro.key);
+        if (!leve) return registro;
+        const visto = !!leve.visto;
+        let mudou = visto !== !!registro.visto;
+        for (const campo of CAMPOS_DO_INDICE_QUE_VENCEM) {
+            if (leve[campo] !== undefined && leve[campo] !== registro[campo]) mudou = true;
         }
-        return total;
+        if (!mudou) return registro;
+        const novo = { ...registro, visto };
+        for (const campo of CAMPOS_DO_INDICE_QUE_VENCEM) if (leve[campo] !== undefined) novo[campo] = leve[campo];
+        return novo;
+    }
+
+    // Filtros novos da rodada 4, iguais em todas as listas: so com uma
+    // reacao (emoji), tipo de midia, so com link, autor. Mensagem salva
+    // antes da rodada 4 nao tem esses campos e nao passa nos filtros ate
+    // ser escaneada de novo.
+    const REGEX_TEM_LINK = /(?:https?:\/\/|t\.me\/|tg:\/\/)/i;
+    function passaNosFiltrosExtras(valor, { emoji, midia, soLink, de }) {
+        if (emoji && !(valor.emojis || []).some((par) => par[0] === emoji)) return false;
+        if (midia && (midia === "sem" ? !!valor.midia : valor.midia !== midia)) return false;
+        if (soLink && !valor.link && !(valor.texto && REGEX_TEM_LINK.test(valor.texto))) return false;
+        if (de && valor.de !== de) return false;
+        return true;
+    }
+
+    // Quantas mensagens de um chat ja estao salvas - usado pela tabela "o
+    // que ja foi salvo". Antes percorria o indice INTEIRO uma vez por chat,
+    // e a tabela e redesenhada a cada checkpoint do scan: com centenas de
+    // chats e milhoes de mensagens, bilhoes de comparacoes por checkpoint.
+    // Agora e uma contagem mantida em memoria (abrirBanco/salvarMensagem).
+    function contarMensagensDoChat(db, chatId) {
+        return db.contagemPorChat.get(chatId) || 0;
     }
 
     // Filtra o indice inteiro (ja em memoria - nenhuma leitura de disco
@@ -170009,24 +170366,59 @@ window.TRP_VERSAO = "2026.10.13.2";
     // "Configurar grupos" nao pode continuar poluindo o ranking "Todos os
     // grupos" (bug real reportado pelo usuario e corrigido antes desta
     // troca de armazenamento - ver HISTORICO_TECNICO.md v2026.10.10.2).
-    function buscarTop(db, { chatId, minimo, limite, dataDe, dataAte, ordenarPor, excluidos }) {
+    // Os "limite" primeiros itens pela ordem de "comparar", sem guardar nem
+    // ordenar a lista inteira de candidatos: mantem so um vetor ordenado de
+    // tamanho "limite" (insercao por busca binaria). Antes cada troca de
+    // filtro ordenava TODAS as mensagens que passavam no filtro (milhoes,
+    // com "minimo 0") pra mostrar 50. Sem limite, junta tudo e ordena no fim.
+    function criarSelecaoDosPrimeiros(limite, comparar) {
+        const itens = [];
+        return {
+            adicionar(item) {
+                if (!limite) {
+                    itens.push(item);
+                    return;
+                }
+                if (itens.length === limite && comparar(item, itens[limite - 1]) >= 0) return;
+                let baixo = 0;
+                let alto = itens.length;
+                while (baixo < alto) {
+                    const meio = (baixo + alto) >> 1;
+                    if (comparar(item, itens[meio]) < 0) alto = meio;
+                    else baixo = meio + 1;
+                }
+                itens.splice(baixo, 0, item);
+                if (itens.length > limite) itens.pop();
+            },
+            resultado() {
+                return limite ? itens : itens.sort(comparar);
+            },
+        };
+    }
+
+    const compararPorReacoes = (a, b) => (b.reactionTotal || 0) - (a.reactionTotal || 0);
+    const compararPorData = (a, b) => (a.dateUtc < b.dateUtc ? 1 : a.dateUtc > b.dateUtc ? -1 : 0);
+
+    // "ocultarVistos": tira as ja marcadas como vistas ANTES de cortar no
+    // limite - antes era filtrado so na tela, depois do corte em 50, entao
+    // com muita coisa vista a lista vinha quase vazia e "Mostrar mais"
+    // tinha que ser clicado varias vezes.
+    function buscarTop(db, { chatId, minimo, limite, dataDe, dataAte, ordenarPor, excluidos, ocultarVistos, emoji, midia, soLink, de }) {
+        const extras = { emoji, midia, soLink, de };
         const minimoReacoes = minimo || 0;
-        const resultados = [];
+        const selecao = criarSelecaoDosPrimeiros(limite, ordenarPor === "data" ? compararPorData : compararPorReacoes);
         for (const valor of db.indice.values()) {
             if ((valor.reactionTotal || 0) < minimoReacoes) continue;
             if (chatId && valor.chatId !== chatId) continue;
             if (excluidos && excluidos.has(valor.chatId)) continue;
+            if (ocultarVistos && valor.visto) continue;
             const dataDaMensagem = (valor.dateUtc || "").slice(0, 10);
             if (dataDe && dataDaMensagem < dataDe) continue;
             if (dataAte && dataDaMensagem > dataAte) continue;
-            resultados.push(valor);
+            if (!passaNosFiltrosExtras(valor, extras)) continue;
+            selecao.adicionar(valor);
         }
-        if (ordenarPor === "data") {
-            resultados.sort((a, b) => (a.dateUtc < b.dateUtc ? 1 : -1));
-        } else {
-            resultados.sort((a, b) => (b.reactionTotal || 0) - (a.reactionTotal || 0));
-        }
-        return resultados.slice(0, limite);
+        return selecao.resultado();
     }
 
     // Existia como caminho separado (mais caro) quando o armazenamento era
@@ -170052,19 +170444,21 @@ window.TRP_VERSAO = "2026.10.13.2";
     // LIMITACAO CONHECIDA: so pega mensagem escaneada (ou rescaneada) DEPOIS
     // dessa funcionalidade existir (v2026.10.11.2) - mensagem ja salva antes
     // disso nao tem minhasReacoes no indice ate o chat ser escaneado de novo.
-    function buscarMinhasReacoes(db, { chatId, limite, dataDe, dataAte, excluidos }) {
-        const resultados = [];
+    function buscarMinhasReacoes(db, { chatId, limite, dataDe, dataAte, excluidos, ocultarVistos, emoji, midia, soLink }) {
+        const extras = { emoji, midia, soLink };
+        const selecao = criarSelecaoDosPrimeiros(limite, compararPorData);
         for (const valor of db.indice.values()) {
             if (!valor.minhasReacoes || !valor.minhasReacoes.length) continue;
             if (chatId && valor.chatId !== chatId) continue;
             if (excluidos && excluidos.has(valor.chatId)) continue;
+            if (ocultarVistos && valor.visto) continue;
             const dataDaMensagem = (valor.dateUtc || "").slice(0, 10);
             if (dataDe && dataDaMensagem < dataDe) continue;
             if (dataAte && dataDaMensagem > dataAte) continue;
-            resultados.push(valor);
+            if (!passaNosFiltrosExtras(valor, extras)) continue;
+            selecao.adicionar(valor);
         }
-        resultados.sort((a, b) => (a.dateUtc < b.dateUtc ? 1 : -1));
-        return resultados.slice(0, limite);
+        return selecao.resultado();
     }
 
     // Busca por substring (acentuacao/caixa ignoradas) no texto completo das
@@ -170072,15 +170466,15 @@ window.TRP_VERSAO = "2026.10.13.2";
     // por palavra inteira, as vezes nao acha mensagem que claramente existe
     // (ver HISTORICO_TECNICO.md). So enxerga o que ja foi salvo localmente.
     //
-    // Termo com mais de uma palavra ("arlene lee") NAO exige frase exata
+    // Termo com mais de uma palavra ("ana costa") NAO exige frase exata
     // nem que todas as palavras apareçam - cada palavra e checada separado,
     // e a mensagem entra se QUALQUER UMA delas aparecer em algum lugar do
     // texto (OU logico). Essa ferramenta existe pra achar o maximo possivel
     // (o problema real e mensagem que deveria aparecer e nao aparece, nao o
     // contrario) - entao, de proposito, prioriza nao perder nada a filtrar
-    // demais: "arlene lee" tambem traz "Darlene amaro" e "Marlene soares"
-    // (so tem "arlene"), e eventualmente mensagem que so tem "lee" sem
-    // nenhuma relacao com "arlene". Isso e intencional, pedido pelo usuario -
+    // demais: "ana costa" tambem traz "Mariana" e "Luciana" (so tem
+    // "ana"), e eventualmente mensagem que so tem "costa" sem nenhuma
+    // relacao com "ana". Isso e intencional, pedido pelo usuario -
     // ele prefere resultado a mais (filtra visualmente depois) a resultado
     // a menos. Buscar uma palavra so (sem espaco) se comporta exatamente
     // como sempre: substring simples.
@@ -170096,23 +170490,37 @@ window.TRP_VERSAO = "2026.10.13.2";
     // "excluidos" (Set de chatId, opcional): mesmo raciocinio de buscarTop()
     // - chat desmarcado em "Configurar grupos" tinha suas mensagens ja
     // salvas continuando a aparecer aqui com "Todos os grupos" selecionado.
-    async function buscarTexto(db, { termo, chatId, minimo, limite, ordenarPor, dataDe, dataAte, excluidos }) {
+    const textoNormalizadoPorRegistro = new WeakMap(); // registro -> texto normalizado; some junto com o registro
+
+    async function buscarTexto(db, { termo, chatId, minimo, limite, ordenarPor, dataDe, dataAte, excluidos, ocultarVistos, emoji, midia, soLink, de }) {
+        const extras = { emoji, midia, soLink, de };
         const palavras = normalizarTexto(termo)
             .split(/\s+/)
             .filter(Boolean);
         const minimoReacoes = minimo || 0;
-        const resultados = [];
+        const selecao = criarSelecaoDosPrimeiros(limite, ordenarPor === "reacoes" ? compararPorReacoes : compararPorData);
 
         const chatsParaVarrer = chatId
             ? [chatId]
             : [...idsDeChatsComDados(db)].filter((id) => !excluidos || !excluidos.has(id));
 
-        const mapas = await Promise.all(chatsParaVarrer.map((id) => obterMensagensCompletasDoChat(db, id)));
-
-        for (const mapa of mapas) {
+        // Memoria: antes, "Todos os grupos" carregava o texto completo de
+        // TODOS os chats de uma vez e deixava tudo em cache pela sessao
+        // inteira - com o historico grande (GBs em disco) isso pode estourar
+        // a memoria da aba. Agora le um chat por vez, o cache tem teto
+        // (obterMensagensCompletasDoChat), e so os "limite" melhores
+        // resultados ficam guardados (criarSelecaoDosPrimeiros). O texto sem
+        // acento de cada mensagem fica guardado (textoNormalizadoPorRegistro)
+        // enquanto o registro estiver em cache: a segunda busca nao refaz o
+        // normalize() de cada mensagem.
+        for (const idChat of chatsParaVarrer) {
+            const mapa = await obterMensagensCompletasDoChat(db, idChat);
             for (const valor of mapa.values()) {
-                const texto = valor.texto || valor.textPreview || "";
-                const textoNormalizado = normalizarTexto(texto);
+                let textoNormalizado = textoNormalizadoPorRegistro.get(valor);
+                if (textoNormalizado === undefined) {
+                    textoNormalizado = normalizarTexto(valor.texto || valor.textPreview || "");
+                    textoNormalizadoPorRegistro.set(valor, textoNormalizado);
+                }
                 // palavras.length === 0 (termo em branco/so espaco) conta
                 // como "bate com tudo", de proposito - pedido do usuario
                 // pra poder deixar o campo vazio e usar esta busca como um
@@ -170120,18 +170528,17 @@ window.TRP_VERSAO = "2026.10.13.2";
                 const bateAlgumaPalavra = palavras.length === 0 || palavras.some((p) => textoNormalizado.includes(p));
                 const dataDaMensagem = (valor.dateUtc || "").slice(0, 10);
                 const bateData = (!dataDe || dataDaMensagem >= dataDe) && (!dataAte || dataDaMensagem <= dataAte);
-                if ((valor.reactionTotal || 0) >= minimoReacoes && bateAlgumaPalavra && bateData) {
-                    resultados.push(valor);
+                if (bateAlgumaPalavra && bateData) {
+                    const comVisto = comVistoDoIndice(db, valor);
+                    if ((comVisto.reactionTotal || 0) < minimoReacoes) continue;
+                    if (ocultarVistos && comVisto.visto) continue;
+                    if (!passaNosFiltrosExtras(comVisto, extras)) continue;
+                    selecao.adicionar(comVisto);
                 }
             }
         }
 
-        if (ordenarPor === "reacoes") {
-            resultados.sort((a, b) => (b.reactionTotal || 0) - (a.reactionTotal || 0));
-        } else {
-            resultados.sort((a, b) => (a.dateUtc < b.dateUtc ? 1 : -1));
-        }
-        return resultados.slice(0, limite);
+        return selecao.resultado();
     }
 
     // Agrupa uma lista de mensagens por chat, preservando a ordem de
@@ -170170,7 +170577,8 @@ window.TRP_VERSAO = "2026.10.13.2";
         let total = 0;
         if (mensagem.reactions && mensagem.reactions.results) {
             for (const r of mensagem.reactions.results) {
-                const emoji = (r.reaction && r.reaction.emoticon) || "custom";
+                const emoji =
+                    (r.reaction && r.reaction.emoticon) || (r.reaction && r.reaction.className === "ReactionPaid" ? "estrela" : "custom");
                 reactions.push({ emoji, count: r.count });
                 total += r.count;
                 if (r.chosenOrder !== undefined && r.chosenOrder !== null) {
@@ -170296,10 +170704,8 @@ window.TRP_VERSAO = "2026.10.13.2";
                     '<span style="color:#5ec26a;">valido</span> - ' +
                     escapeHtml(enderecoLink) +
                     (detalhes.length ? " (" + detalhes.join(", ") + ")" : "") +
-                    ' <span style="color:#4da3ff;cursor:pointer;" class="trp-abrir-link">abrir</span>';
-                item.querySelector(".trp-abrir-link").addEventListener("click", () => {
-                    window.open("https://" + enderecoLink, "_blank");
-                });
+                    " ";
+                item.appendChild(criarLinkExterno("abrir", "https://" + enderecoLink, "color:#4da3ff;"));
             } else {
                 item.innerHTML =
                     '<span style="color:#ff6b6b;">invalido ou expirado</span> - ' +
@@ -170321,7 +170727,7 @@ window.TRP_VERSAO = "2026.10.13.2";
     function normalizarTexto(texto) {
         return (texto || "")
             .normalize("NFD")
-            .replace(/[̀-ͯ]/g, "")
+            .replace(/[\u0300-\u036f]/g, "") // escape em vez do caractere cru: arquivo lido com codificacao errada nao quebra o script inteiro
             .toLowerCase();
     }
 
@@ -170350,6 +170756,33 @@ window.TRP_VERSAO = "2026.10.13.2";
         return texto;
     }
 
+    // Link HTML comum (<a target="_blank">), sem nenhum JS por tras - mesma
+    // decisao da v2026.10.12.5 pros links de mensagem: window.open chamado
+    // de dentro do sandbox do Tampermonkey no Edge deixava a aba original
+    // inutilizavel (ver HISTORICO_TECNICO.md v2026.10.12.3 a .5). Os links
+    // "abrir" da Busca avancada ainda usavam window.open.
+    function criarLinkExterno(texto, url, estilo) {
+        const link = document.createElement("a");
+        link.href = url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = texto;
+        link.style.cssText = "text-decoration:none;" + (estilo || "");
+        return link;
+    }
+
+    // href do link que abre a mensagem exata no Telegram Web (ver
+    // idBaseDoChatId). Passa por encodeURIComponent porque chatId/messageId
+    // podem vir de um backup importado (arquivo de fora), nao so do scan.
+    function urlDaMensagem(m) {
+        return (
+            "https://web.telegram.org/k/#" +
+            encodeURIComponent(idBaseDoChatId(m.chatId)) +
+            "?post=" +
+            encodeURIComponent(m.messageId)
+        );
+    }
+
     function criarBotao() {
         const botao = document.createElement("button");
         botao.textContent = "Gestor TLGR";
@@ -170371,6 +170804,8 @@ window.TRP_VERSAO = "2026.10.13.2";
         });
         botao.addEventListener("click", alternarPainel);
         document.body.appendChild(botao);
+        botaoFlutuante = botao;
+        if (typeof atualizarContadoresDeNovos === "function") atualizarContadoresDeNovos(null);
     }
 
     function alternarPainel() {
@@ -170578,6 +171013,7 @@ window.TRP_VERSAO = "2026.10.13.2";
             // se der erro no logOut remoto, ainda assim limpa localmente
         }
         cliente = null;
+        limparCacheDaConta();
         GM_setValue(CHAVE_SESSAO, "");
         decidirTela();
     }
@@ -170707,9 +171143,19 @@ window.TRP_VERSAO = "2026.10.13.2";
     // Pede um valor ao usuario dentro do proprio painel (ex.: codigo de
     // login, senha de duas etapas) e devolve uma Promise que resolve quando
     // ele confirma. Usado pelos callbacks do client.start().
+    // Erro da tentativa anterior de login (ex.: PHONE_CODE_INVALID). O
+    // client.start() chama onError e logo depois pede o codigo de novo -
+    // como pedirValor() limpa a tela, o aviso do onError sumia antes de
+    // aparecer e o usuario so via o campo vazio de novo, sem saber que o
+    // codigo estava errado. Agora pedirValor() mostra esse erro em cima.
+    let erroLoginAnterior = "";
     function pedirValor(rotulo, tipo) {
         return new Promise((resolve) => {
             const corpo = corpoDoPainel();
+            if (erroLoginAnterior) {
+                textoAviso(corpo, erroLoginAnterior, "#ff6b6b").style.margin = "0 0 10px";
+                erroLoginAnterior = "";
+            }
             const input = campoTexto(corpo, rotulo, tipo || "text");
             const botao = botaoAcao(corpo, "Confirmar");
             const confirmar = () => {
@@ -170737,7 +171183,7 @@ window.TRP_VERSAO = "2026.10.13.2";
             return telaLogado();
         }
         if (sessaoSalva) {
-            return reconectarComSessaoSalva(apiId, apiHash, sessaoSalva);
+            return reconectarComSessaoSalva(apiId, apiHash);
         }
         return telaLogin(apiId, apiHash);
     }
@@ -170777,24 +171223,60 @@ window.TRP_VERSAO = "2026.10.13.2";
         });
     }
 
-    async function reconectarComSessaoSalva(apiId, apiHash, sessaoSalva) {
+    // Conexao UNICA com a sessao salva, compartilhada entre o painel e as
+    // ferramentas de fundo (ferramentas_fundo.js). Antes cada um criava a
+    // sua: abrir o painel e dar Alt+clique ao mesmo tempo abria duas
+    // conexoes MTProto com a mesma sessao, e uma ficava aberta a toa. Quem
+    // chamar enquanto ja esta conectando recebe a mesma promessa. "cliente"
+    // so e preenchido DEPOIS de autorizado - antes, fechar e reabrir o
+    // painel no meio da reconexao caia em telaLogado() com um cliente que
+    // ainda nao estava pronto.
+    // Devolve o cliente, ou null se a sessao salva nao vale mais (nesse
+    // caso ja apaga a sessao salva).
+    let conectandoComSessaoSalva = null;
+    function conectarComSessaoSalva() {
+        if (cliente) return Promise.resolve(cliente);
+        if (conectandoComSessaoSalva) return conectandoComSessaoSalva;
+        conectandoComSessaoSalva = (async () => {
+            const apiId = GM_getValue(CHAVE_API_ID, "");
+            const apiHash = GM_getValue(CHAVE_API_HASH, "");
+            const sessaoSalva = GM_getValue(CHAVE_SESSAO, "");
+            if (!apiId || !apiHash || !sessaoSalva) return null;
+            const novo = novoCliente(apiId, apiHash, sessaoSalva);
+            try {
+                await novo.connect();
+                if (!(await novo.checkAuthorization())) {
+                    GM_setValue(CHAVE_SESSAO, "");
+                    await novo.disconnect().catch(() => {});
+                    return null;
+                }
+            } catch (erro) {
+                await novo.disconnect().catch(() => {});
+                throw erro;
+            }
+            if (!cliente) cliente = novo;
+            return cliente;
+        })();
+        conectandoComSessaoSalva.then(
+            () => (conectandoComSessaoSalva = null),
+            () => (conectandoComSessaoSalva = null)
+        );
+        return conectandoComSessaoSalva;
+    }
+
+    async function reconectarComSessaoSalva(apiId, apiHash) {
         definirTituloTela(null);
         const corpo = corpoDoPainel();
         textoAviso(corpo, "Reconectando com a sessao salva...");
         try {
-            cliente = novoCliente(apiId, apiHash, sessaoSalva);
-            await cliente.connect();
-            const autorizado = await cliente.checkAuthorization();
-            if (!autorizado) {
-                cliente = null;
-                GM_setValue(CHAVE_SESSAO, "");
+            const conectado = await conectarComSessaoSalva();
+            if (!conectado) {
                 textoAviso(corpo, "Sessao salva nao e mais valida, faca login de novo.", "#ff6b6b");
                 telaLogin(apiId, apiHash);
                 return;
             }
             telaLogado();
         } catch (erro) {
-            cliente = null;
             textoAviso(corpo, "Erro ao reconectar: " + (erro && erro.message ? erro.message : erro), "#ff6b6b");
         }
     }
@@ -170813,8 +171295,9 @@ window.TRP_VERSAO = "2026.10.13.2";
                 botao.disabled = false;
                 return;
             }
+            erroLoginAnterior = "";
+            const novoClienteLogin = novoCliente(apiId, apiHash, "");
             try {
-                const novoClienteLogin = novoCliente(apiId, apiHash, "");
                 await novoClienteLogin.start({
                     phoneNumber: async () => numero,
                     phoneCode: async (ehPeloApp, info) =>
@@ -170828,7 +171311,8 @@ window.TRP_VERSAO = "2026.10.13.2";
                             "password"
                         ),
                     onError: async (erro) => {
-                        textoAviso(corpo, "Erro: " + (erro && erro.message ? erro.message : erro), "#ff6b6b");
+                        erroLoginAnterior = "Erro: " + (erro && erro.message ? erro.message : erro);
+                        textoAviso(corpo, erroLoginAnterior, "#ff6b6b");
                         return false; // false = tenta de novo em vez de cancelar
                     },
                 });
@@ -170836,6 +171320,7 @@ window.TRP_VERSAO = "2026.10.13.2";
                 GM_setValue(CHAVE_SESSAO, cliente.session.save());
                 telaLogado();
             } catch (erro) {
+                novoClienteLogin.disconnect().catch(() => {}); // senao a conexao da tentativa que falhou fica aberta
                 textoAviso(corpo, "Erro ao entrar: " + (erro && erro.message ? erro.message : erro), "#ff6b6b");
                 botao.disabled = false;
             }
@@ -170847,7 +171332,12 @@ window.TRP_VERSAO = "2026.10.13.2";
         const corpo = corpoDoPainel();
         textoAviso(corpo, "Carregando dados da conta...");
         try {
-            const eu = await cliente.getMe();
+            // getMe() so na primeira vez por conexao - antes rodava a cada
+            // "Voltar" pro menu (uma chamada de rede por clique).
+            if (!dadosDaContaEmCache || dadosDaContaEmCache.cliente !== cliente) {
+                dadosDaContaEmCache = { cliente, eu: await cliente.getMe() };
+            }
+            const eu = dadosDaContaEmCache.eu;
             const nome = [eu.firstName, eu.lastName].filter(Boolean).join(" ") || "(sem nome)";
             const usuario = eu.username ? "@" + eu.username : "sem username publico";
             corpo.innerHTML =
@@ -170880,21 +171370,34 @@ window.TRP_VERSAO = "2026.10.13.2";
             botaoMinhasReacoes.addEventListener("click", () => telaMinhasReacoes());
             const botaoBusca = botaoAcao(corpo, "Buscar mensagens");
             botaoBusca.addEventListener("click", () => telaBusca());
-            const botaoBuscaAvancada = botaoAcao(corpo, "Busca avancada (grupos/canais publicos)");
+            const botaoBuscaAvancada = botaoAcao(corpo, "Busca avancada (grupos, canais, pessoas e links)");
             botaoBuscaAvancada.addEventListener("click", () => telaBuscaAvancada());
-            const botaoVerificar = botaoAcao(corpo, "Verificar mensagem (local vs. ao vivo)");
-            botaoVerificar.addEventListener("click", () => telaVerificarMensagem());
-            // Ultimo da lista de proposito - e um item de configuracao, nao
-            // uma ferramenta do dia-a-dia como as de cima (pedido do usuario).
-            const botaoConfigurarGrupos = botaoAcao(corpo, "Configurar grupos do scan (incluir/excluir)");
-            botaoConfigurarGrupos.style.background = "#2a2f3a";
-            botaoConfigurarGrupos.addEventListener("click", () => telaConfigurarGrupos());
-            const botaoHistorico = botaoAcao(corpo, "Historico de buscas (gerenciar/limpar)");
-            botaoHistorico.style.background = "#2a2f3a";
-            botaoHistorico.addEventListener("click", () => telaHistoricoBusca());
+            // Rodada 4: Monitorados (com o numero de novas), Favoritos e
+            // Downloads. "Verificar mensagem" saiu do menu: colar o link da
+            // mensagem na Busca avancada faz a mesma conferencia.
+            const botaoMonitorados = botaoAcao(corpo, "Monitorados");
+            botaoMonitorados.id = "trp-botao-monitorados";
+            botaoMonitorados.addEventListener("click", () => telaMonitorados());
+            const botaoFavoritos = botaoAcao(corpo, "Favoritos (mensagens e buscas salvas)");
+            botaoFavoritos.addEventListener("click", () => telaFavoritos());
+            const botaoDownloads = botaoAcao(corpo, "Downloads (baixando agora e ultimos arquivos)");
+            botaoDownloads.addEventListener("click", () => telaDownloads());
+            // Ferramenta com tela propria (hoje so o lote) aparece aqui quando
+            // ligada; o liga/desliga fica em Configuracoes.
+            for (const definicao of linhasDoMenuFerramentas) {
+                if (!definicao.botao || !definicao.ligada()) continue;
+                const botaoFerramenta = botaoAcao(corpo, definicao.botao.textoNoMenu || definicao.botao.texto);
+                botaoFerramenta.addEventListener("click", definicao.botao.aoClicar);
+            }
+            // Cinza = configuracao, nao uso do dia a dia (pedido do usuario).
+            const botaoConfiguracoes = botaoAcao(corpo, "Configuracoes (ferramentas, filtros, grupos, pasta, downloads, monitorados)");
+            botaoConfiguracoes.style.background = "#2a2f3a";
+            botaoConfiguracoes.addEventListener("click", () => telaConfiguracoes());
             const botaoBackup = botaoAcao(corpo, "Backup dos dados (exportar/importar)");
             botaoBackup.style.background = "#2a2f3a";
             botaoBackup.addEventListener("click", () => telaBackup());
+            const db = await abrirBanco();
+            atualizarContadoresDeNovos(db);
             atualizarVisibilidadeSair(true);
         } catch (erro) {
             textoAviso(corpo, "Erro ao carregar a conta: " + (erro && erro.message ? erro.message : erro), "#ff6b6b");
@@ -170945,7 +171448,9 @@ window.TRP_VERSAO = "2026.10.13.2";
         });
     }
 
-    function botaoVoltar(corpo) {
+    // destino: tela pra onde volta (padrao: o menu). As telas que agora
+    // ficam dentro de Configuracoes voltam pra ela.
+    function botaoVoltar(corpo, destino) {
         const botao = document.createElement("button");
         botao.textContent = "← Voltar";
         // Antes era texto puro sem fundo nem borda (font-size:12px) - dificil
@@ -170955,7 +171460,7 @@ window.TRP_VERSAO = "2026.10.13.2";
         botao.style.cssText =
             "background:#0c0e12;border:1px solid #2a2f3a;border-radius:6px;color:#c7cbd4;cursor:pointer;" +
             "font-size:13px;font-weight:600;margin-bottom:12px;padding:6px 12px;";
-        botao.addEventListener("click", () => telaLogado());
+        botao.addEventListener("click", () => (destino ? destino() : telaLogado()));
         corpo.appendChild(botao);
         return botao;
     }
@@ -170967,14 +171472,64 @@ window.TRP_VERSAO = "2026.10.13.2";
     // devolve a pasta principal. Sem isso, um grupo que foi arquivado DEPOIS
     // de ja ter sido escaneado nunca mais aparece em "Configurar grupos" pra
     // poder ser excluido - ele fica preso pra sempre nas listas de
-    // status/busca (que leem direto do que ja foi salvo no IndexedDB, sem
+    // status/busca (que leem direto do que ja foi salvo no disco, sem
     // ligar se o grupo ainda esta na pasta principal) sem nenhum jeito de
     // tirar ele de la pela tela de configuracao. Toda funcao que precisa
     // enumerar "todos os grupos/canais da conta" usa essa, nunca
     // cliente.iterDialogs({}) direto.
+    //
+    // Sem repetir: pela documentacao do Telethon (que o teleproto espelha),
+    // iterDialogs sem "archived" devolve TODOS os dialogs, arquivados
+    // inclusive - nesse caso a segunda passada repetiria cada grupo
+    // arquivado (scan dele 2x por rodada, "grupo X de Y" inflado, item
+    // duplicado nas listas). Nao deu pra confirmar contra a conta real qual
+    // dos dois comportamentos o servidor tem; o filtro por id e inofensivo
+    // nos dois casos.
     async function* iterTodosOsDialogs() {
-        yield* cliente.iterDialogs({});
-        yield* cliente.iterDialogs({ archived: true });
+        const vistos = new Set();
+        for (const opcoes of [{}, { archived: true }]) {
+            for await (const dialog of cliente.iterDialogs(opcoes)) {
+                const id = String(dialog.id);
+                if (vistos.has(id)) continue;
+                vistos.add(id);
+                yield dialog;
+            }
+        }
+    }
+
+    // Lista de dialogs em cache por 2 minutos. Antes, abrir a tela de scan
+    // percorria TODOS os dialogs da conta duas vezes (lista do seletor e
+    // aviso de "tem mensagem nova"), e "Buscar ao vivo", "Verificar
+    // mensagem" e o Alt+clique percorriam de novo a cada uso so pra achar
+    // um chat - com centenas de grupos, segundos de espera e chamadas de API
+    // repetidas. forcar=true ignora o cache (o scan sempre usa a lista
+    // fresca). Quem chama enquanto ja esta carregando recebe a mesma
+    // promessa.
+    const VALIDADE_CACHE_DIALOGS_MS = 2 * 60 * 1000;
+    let cacheDialogs = null; // { quando, lista, porId }
+    let carregandoDialogs = null;
+    async function listarDialogs(forcar) {
+        if (!forcar && cacheDialogs && Date.now() - cacheDialogs.quando < VALIDADE_CACHE_DIALOGS_MS) {
+            return cacheDialogs.lista;
+        }
+        if (!carregandoDialogs) {
+            carregandoDialogs = (async () => {
+                const lista = [];
+                for await (const dialog of iterTodosOsDialogs()) lista.push(dialog);
+                cacheDialogs = { quando: Date.now(), lista, porId: new Map(lista.map((d) => [String(d.id), d])) };
+                return lista;
+            })();
+            carregandoDialogs.then(
+                () => (carregandoDialogs = null),
+                () => (carregandoDialogs = null)
+            );
+        }
+        return carregandoDialogs;
+    }
+
+    function limparCacheDaConta() {
+        cacheDialogs = null;
+        dadosDaContaEmCache = null;
     }
 
     // Lista os grupos/canais da conta (pra popular o seletor de "qual grupo
@@ -170982,7 +171537,7 @@ window.TRP_VERSAO = "2026.10.13.2";
     // id+titulo, sem mexer no banco.
     async function carregarGruposParaSelecao() {
         const grupos = [];
-        for await (const dialog of iterTodosOsDialogs()) {
+        for (const dialog of await listarDialogs(false)) {
             if (!(dialog.isGroup || dialog.isChannel)) continue;
             grupos.push({ chatId: String(dialog.id), titulo: dialog.title || dialog.name || String(dialog.id) });
         }
@@ -171004,7 +171559,7 @@ window.TRP_VERSAO = "2026.10.13.2";
     async function telaConfigurarGrupos() {
         definirTituloTela("Configurar grupos");
         const corpo = corpoDoPainel();
-        botaoVoltar(corpo);
+        botaoVoltar(corpo, () => telaConfiguracoes("scan"));
 
         const aviso = document.createElement("div");
         aviso.style.cssText = "display:flex;align-items:center;gap:4px;color:#8b92a3;margin-bottom:10px;";
@@ -171044,7 +171599,7 @@ window.TRP_VERSAO = "2026.10.13.2";
             // usuario SAIU, ou que mudou de chatId (grupo comum virou
             // supergrupo - Telegram troca o id nessa migracao), nao aparece
             // em carregarGruposParaSelecao() (que so ve a conta HOJE) mas os
-            // dados escaneados dele continuam no IndexedDB pra sempre, e sem
+            // dados escaneados dele continuam no disco pra sempre, e sem
             // aparecer aqui o usuario nunca consegue marcar ele como
             // excluido. Mostra esses tambem, separados, com o titulo salvo
             // na epoca do scan.
@@ -171128,7 +171683,7 @@ window.TRP_VERSAO = "2026.10.13.2";
     function telaHistoricoBusca() {
         definirTituloTela("Historico de buscas");
         const corpo = corpoDoPainel();
-        botaoVoltar(corpo);
+        botaoVoltar(corpo, () => telaConfiguracoes("historico"));
 
         const renderizarBloco = (titulo, chave) => {
             const secao = document.createElement("div");
@@ -171196,11 +171751,10 @@ window.TRP_VERSAO = "2026.10.13.2";
 
     // ---- Tela de configuracao: backup dos dados escaneados ----
 
-    // Tudo que o scan acha mora so no IndexedDB deste navegador - sem
-    // nenhuma copia em servidor nenhum. Perfil do Chrome resetado ou cache
-    // do site limpo apaga tudo pra sempre, sem jeito de recuperar. Exporta
-    // chats+mensagens num arquivo .json que o usuario guarda onde quiser, e
-    // importa de volta quando precisar. Importar faz put() registro por
+    // Os dados moram na pasta escolhida no disco (desde v2026.10.11.1);
+    // copiar a pasta e o backup mais seguro. Isto aqui exporta
+    // chats+mensagens num arquivo .json so, e importa de volta quando
+    // precisar. Importar grava registro por
     // registro - nunca apaga nada que ja esta no banco e nao esta no
     // arquivo, so sobrescreve registros com a mesma chave (mesmo chatId ou
     // mesma mensagem) - por isso e seguro restaurar por cima de um banco
@@ -171214,9 +171768,9 @@ window.TRP_VERSAO = "2026.10.13.2";
         const aviso = document.createElement("div");
         aviso.style.cssText = "display:flex;align-items:center;gap:4px;color:#8b92a3;margin-bottom:14px;";
         aviso.innerHTML =
-            '<span>Os dados do scan moram so neste navegador - exporta pra nao perder.</span>' +
+            '<span>Os dados ja ficam na pasta que voce escolheu no disco - copiar essa pasta e o backup mais seguro.</span>' +
             criarIconeInfoHtml(
-                'Tudo que o scan encontra (mensagens, reacoes, chats) fica so no IndexedDB deste navegador, sem copia em nenhum servidor. Se o perfil do Chrome for resetado ou o cache do site for limpo, perde tudo pra sempre. Exporta de vez em quando (ou antes de qualquer mudanca grande no computador/navegador) e guarda o arquivo em algum lugar seguro. Importar um arquivo de volta nunca apaga dado que ja esta no banco - so sobrescreve o que tiver a mesma chave, entao e seguro restaurar por cima de um banco que ja tem coisa.'
+                'Desde a v2026.10.11.1 tudo que o scan encontra fica em arquivos na pasta de armazenamento escolhida (chats.json, indice.jsonl e a pasta mensagens). Limpar dados do navegador NAO apaga essa pasta. O jeito mais seguro de fazer backup e copiar a pasta inteira (com o painel fechado ou sem scan rodando). O .json abaixo junta tudo num arquivo so: pratico pra historico pequeno, mas com historico muito grande (centenas de MB) o navegador pode ficar sem memoria ao gerar ou ao importar. Importar nunca apaga dado que ja esta salvo - so sobrescreve o que tiver a mesma chave.'
             );
         corpo.appendChild(aviso);
 
@@ -171228,24 +171782,45 @@ window.TRP_VERSAO = "2026.10.13.2";
         botaoExportar.addEventListener("click", async () => {
             botaoExportar.disabled = true;
             statusExportar.textContent = "Lendo banco local...";
+            const nomeArquivo = "gestor-tlgr-backup-" + new Date().toISOString().slice(0, 10) + ".json";
+            const mostrarProgresso = (texto) => (statusExportar.textContent = texto);
             try {
                 const db = await abrirBanco();
-                const [chats, mensagens] = await Promise.all([listarChats(db), listarTodasMensagens(db)]);
-                const backup = {
-                    formato: "gestor-tlgr-backup",
-                    versaoApp: VERSAO_PAINEL,
-                    geradoEm: new Date().toISOString(),
-                    chats,
-                    mensagens,
-                };
-                const blob = new Blob([JSON.stringify(backup)], { type: "application/json" });
-                const url = URL.createObjectURL(blob);
-                const link = document.createElement("a");
-                link.href = url;
-                link.download = "gestor-tlgr-backup-" + new Date().toISOString().slice(0, 10) + ".json";
-                link.click();
-                URL.revokeObjectURL(url);
-                statusExportar.textContent = `Exportado: ${chats.length} grupo(s)/canal(is), ${mensagens.length} mensagem(ns).`;
+                await descarregarEscritasPendentes(db);
+                let resumo;
+                if (window.showSaveFilePicker) {
+                    let destino;
+                    try {
+                        destino = await window.showSaveFilePicker({
+                            suggestedName: nomeArquivo,
+                            types: [{ description: "Backup Gestor TLGR", accept: { "application/json": [".json"] } }],
+                        });
+                    } catch (erro) {
+                        if (erro && erro.name === "AbortError") {
+                            statusExportar.textContent = "";
+                            return; // fechou a janela sem escolher - nao e erro
+                        }
+                        throw erro;
+                    }
+                    const escrita = await destino.createWritable();
+                    try {
+                        resumo = await gerarPedacosDoBackup(db, (pedaco) => escrita.write(pedaco), mostrarProgresso);
+                        await escrita.close();
+                    } catch (erro) {
+                        await escrita.abort().catch(() => {});
+                        throw erro;
+                    }
+                } else {
+                    const pedacos = [];
+                    resumo = await gerarPedacosDoBackup(db, (pedaco) => pedacos.push(pedaco), mostrarProgresso);
+                    const url = URL.createObjectURL(new Blob(pedacos, { type: "application/json" }));
+                    const link = document.createElement("a");
+                    link.href = url;
+                    link.download = nomeArquivo;
+                    link.click();
+                    setTimeout(() => URL.revokeObjectURL(url), 60000); // revogar na hora pode cancelar o download em alguns navegadores
+                }
+                statusExportar.textContent = `Exportado: ${resumo.totalChats} grupo(s)/canal(is), ${resumo.totalMensagens} mensagem(ns).`;
             } catch (erro) {
                 statusExportar.textContent = "Erro ao exportar: " + (erro && erro.message ? erro.message : erro);
             } finally {
@@ -171292,17 +171867,22 @@ window.TRP_VERSAO = "2026.10.13.2";
                 }
 
                 const db = await abrirBanco();
-                statusImportar.textContent = `Restaurando ${backup.chats.length} grupo(s)/canal(is)...`;
-                for (const chat of backup.chats) await salvarChat(db, chat);
-
                 let restauradas = 0;
                 for (const mensagem of backup.mensagens) {
-                    await salvarMensagem(db, mensagem);
+                    // Em lote (ver "Gravacao em lote" perto de abrirBanco) -
+                    // 1 gravacao por mensagem copiava o indice inteiro a cada vez.
+                    await salvarMensagem(db, mensagem, { adiarGravacao: true });
                     restauradas++;
                     if (restauradas % 1000 === 0) {
                         statusImportar.textContent = `Restaurando mensagens... ${restauradas} de ${backup.mensagens.length}`;
                     }
                 }
+                await descarregarEscritasPendentes(db);
+                // Checkpoints dos chats so DEPOIS das mensagens gravadas: se a
+                // importacao parar no meio, nenhum chat fica marcado como
+                // escaneado ate um ponto cujas mensagens nao estao no disco.
+                statusImportar.textContent = `Restaurando ${backup.chats.length} grupo(s)/canal(is)...`;
+                for (const chat of backup.chats) await salvarChat(db, chat);
 
                 statusImportar.textContent =
                     `Restaurado: ${backup.chats.length} grupo(s)/canal(is), ${backup.mensagens.length} mensagem(ns)` +
@@ -171322,10 +171902,13 @@ window.TRP_VERSAO = "2026.10.13.2";
     // dialog.entity pra chamar iterMessages. So itera os dialogs ate achar
     // (nao da pra montar o InputPeer so com o chatId sem o access_hash).
     async function encontrarEntidadePorChatId(chatId) {
-        for await (const dialog of iterTodosOsDialogs()) {
-            if (String(dialog.id) === chatId) return dialog.entity;
+        await listarDialogs(false);
+        let dialog = cacheDialogs && cacheDialogs.porId.get(chatId);
+        if (!dialog) {
+            await listarDialogs(true); // grupo que a conta acabou de entrar ainda nao estava no cache
+            dialog = cacheDialogs && cacheDialogs.porId.get(chatId);
         }
-        return null;
+        return dialog ? dialog.entity : null;
     }
 
     // Pega, numa unica passada por iterDialogs (a mesma chamada ja usada em
@@ -171337,9 +171920,9 @@ window.TRP_VERSAO = "2026.10.13.2";
     // tem mensagem nova que o scan ainda nao viu, sem escanear nada - so
     // serve de aviso (badge "desatualizado"), nao substitui rodar o scan de
     // verdade.
-    async function buscarUltimaMensagemPorChat() {
+    async function buscarUltimaMensagemPorChat(forcar) {
         const mapa = new Map();
-        for await (const dialog of iterTodosOsDialogs()) {
+        for (const dialog of await listarDialogs(forcar)) {
             if (!(dialog.isGroup || dialog.isChannel)) continue;
             mapa.set(String(dialog.id), dialog.message ? dialog.message.id : null);
         }
@@ -171394,6 +171977,7 @@ window.TRP_VERSAO = "2026.10.13.2";
                 : '<span style="color:#5ec26a;">completo</span>';
             const ultimoIdReal = ultimasMensagens ? ultimasMensagens.get(c.chatId) : undefined;
             const desatualizado = ultimoIdReal != null && ultimoIdReal > (c.lastScannedMessageId || 0);
+            const percentual = percentualEscaneado(c, ultimoIdReal);
             const avisoDesatualizado = desatualizado
                 ? ' <span style="color:#e0a93a;" title="Tem mensagem nova no grupo desde o ultimo scan - roda o scan de novo (e rapido, so busca o que e novo) pra essa mensagem entrar no calculo de reacoes.">⟳ tem mensagem nova</span>'
                 : "";
@@ -171404,6 +171988,9 @@ window.TRP_VERSAO = "2026.10.13.2";
                     "</td>" +
                     '<td style="padding:4px 6px;text-align:right;">' +
                     total +
+                    "</td>" +
+                    '<td style="padding:4px 6px;text-align:right;" title="Ate onde o scan chegou, comparado com a mensagem mais nova do grupo agora. Cai sozinho quando o grupo recebe mensagem nova e volta a 100% depois do scan.">' +
+                    (percentual == null ? "-" : "~" + percentual + "%") +
                     "</td>" +
                     '<td style="padding:4px 6px;">' +
                     badge +
@@ -171424,12 +172011,30 @@ window.TRP_VERSAO = "2026.10.13.2";
             '<thead><tr style="color:#8b92a3;text-align:left;">' +
             '<th style="padding:4px 6px;white-space:nowrap;">Grupo</th>' +
             '<th style="padding:4px 6px;text-align:right;white-space:nowrap;">Salvas</th>' +
+            '<th style="padding:4px 6px;text-align:right;white-space:nowrap;">Escaneado</th>' +
             '<th style="padding:4px 6px;white-space:nowrap;">Status</th>' +
             '<th style="padding:4px 6px;white-space:nowrap;">Ultimo scan</th>' +
             "</tr></thead><tbody>" +
             linhas.join("") +
             "</tbody></table>" +
             notaOcultosHtml;
+    }
+
+    // Quanto do grupo o scan ja cobriu: id da ultima mensagem escaneada
+    // sobre o id da mensagem mais nova do grupo agora (vem de graca na lista
+    // de dialogs). Dinamico: o grupo recebe mensagem nova, o numero cai;
+    // roda o scan, volta a 100%. So vale pra canal/supergrupo (ids proprios
+    // de 1 em diante); grupo basico usa a numeracao da conta inteira, a
+    // conta nao diria nada - fica "-". Aproximado: mensagem apagada conta
+    // como se existisse; backfill do texto antigo pendente desconta o que
+    // falta dele.
+    function percentualEscaneado(chat, ultimoIdReal) {
+        if (!ultimoIdReal || !String(chat.chatId).startsWith("-100")) return null;
+        let cobertas = Math.min(chat.lastScannedMessageId || 0, ultimoIdReal);
+        if (typeof chat.backfillAlvo === "number" && (chat.textoCompletoAte || 0) < chat.backfillAlvo) {
+            cobertas -= chat.backfillAlvo - (chat.textoCompletoAte || 0);
+        }
+        return Math.max(0, Math.min(100, Math.floor((cobertas / ultimoIdReal) * 100)));
     }
 
     // Zera o checkpoint (lastScannedMessageId) do(s) chat(s) escolhido(s) -
@@ -171448,8 +172053,16 @@ window.TRP_VERSAO = "2026.10.13.2";
     // tambem o unico jeito de uma mensagem ja escaneada ANTES de
     // v2026.10.11.2 ganhar o campo minhasReacoes (ver "Minhas reacoes") sem
     // esperar uma mensagem nova chegar naquele chat.
-    async function resetarCheckpointsParaRescanCompleto(db, apenasChatId) {
-        const chatsParaResetar = apenasChatId ? [apenasChatId] : [...db.chats.keys()];
+    //
+    // "excluidos" (Set, opcional, so usado com "Todos"): grupo desmarcado
+    // em "Configurar grupos" nao entra no scan "Todos", entao tambem nao
+    // pode ter o checkpoint zerado por ele - antes era zerado mesmo assim e,
+    // quando o usuario marcasse o grupo de novo, o scan normal recomecava
+    // ele do zero sem ninguem ter pedido.
+    async function resetarCheckpointsParaRescanCompleto(db, apenasChatId, excluidos) {
+        const chatsParaResetar = apenasChatId
+            ? [apenasChatId]
+            : [...db.chats.keys()].filter((id) => !excluidos || !excluidos.has(id));
         for (const chatId of chatsParaResetar) {
             const chatSalvo = buscarChat(db, chatId);
             if (!chatSalvo) continue;
@@ -171474,6 +172087,7 @@ window.TRP_VERSAO = "2026.10.13.2";
             "</select>";
         corpo.appendChild(blocoSelecao);
         const selectGrupo = blocoSelecao.querySelector("#trp-select-grupo");
+        selectGrupo.addEventListener("change", () => gravarPreferencia("scan_grupo", selectGrupo.value));
 
         // Grupo desmarcado em "Configurar grupos" nao aparece aqui tambem -
         // antes dessa correcao ele ficava escondido da tabela de status e
@@ -171494,6 +172108,7 @@ window.TRP_VERSAO = "2026.10.13.2";
                     opcao.textContent = g.titulo;
                     selectGrupo.appendChild(opcao);
                 }
+                if (!scanEmAndamento) aplicarPreferenciaNoSelect(selectGrupo, "scan_grupo");
             })
             .catch(() => {
                 const carregando = selectGrupo.querySelector("#trp-carregando-grupos");
@@ -171509,7 +172124,7 @@ window.TRP_VERSAO = "2026.10.13.2";
         aviso.innerHTML =
             '<span>Escolhe um grupo especifico ou deixa em "Todos".</span>' +
             criarIconeInfoHtml(
-                'Com "Todos" selecionado, respeita o que estiver desmarcado em "Configurar grupos do scan" (grupo desmarcado la nao entra). Escolher um grupo especifico aqui sempre escaneia ele, mesmo que esteja desmarcado em "Configurar grupos" - so precisa estar presente nesta lista (ou seja, marcado la). Continua de onde parou da ultima vez - pode parar e retomar a hora que quiser. Historico antigo que ainda nao tem texto completo salvo (grupos escaneados antes da busca por palavra-chave existir) e completado automaticamente, sem precisar marcar nada. O texto abaixo pode ficar sem mudar por ate 1 minuto as vezes, principalmente em grupos/canais grandes - e o proprio Telegram limitando a velocidade das consultas (flood control), nao e travamento; o scan continua normalmente assim que a espera passa.'
+                'Com "Todos" selecionado, respeita o que estiver desmarcado em "Configurar grupos do scan" (grupo desmarcado la nao entra). Escolher um grupo especifico aqui sempre escaneia ele, mesmo que esteja desmarcado em "Configurar grupos" - so precisa estar presente nesta lista (ou seja, marcado la). Continua de onde parou da ultima vez - pode parar e retomar a hora que quiser. Historico antigo que ainda nao tem texto completo salvo (grupos escaneados antes da busca por palavra-chave existir) e completado automaticamente, sem precisar marcar nada. Quando o Telegram pede uma pausa (flood control), o texto abaixo mostra a contagem regressiva - nao e travamento; o scan continua sozinho quando a espera passa.'
             );
         corpo.appendChild(aviso);
 
@@ -171540,9 +172155,9 @@ window.TRP_VERSAO = "2026.10.13.2";
         const labelForcarRescan = document.createElement("span");
         labelForcarRescan.style.cssText = "color:#8b92a3;display:flex;align-items:center;gap:4px;";
         labelForcarRescan.innerHTML =
-            "<span>Forcar reescaneamento completo (ignora onde parou)</span>" +
+            "<span>Reescanear do zero (lento - so pra corrigir dados; deixe desmarcado no dia a dia)</span>" +
             criarIconeInfoHtml(
-                'Normalmente o scan "continua de onde parou" - mais rapido, nao repete nada. Marcando isso, o(s) chat(s) escolhido(s) sao relidos da primeira mensagem em diante de novo, mesmo que o scan ja tivesse chegado no fim. Util pra consertar um chat com suspeita de dado incompleto, ou pra preencher retroativamente um recurso novo (ex.: "Minhas reacoes") em chat ja escaneado antes dele existir. Com "Todos" selecionado, reescaneia TODOS os grupos/canais do zero - pode demorar bem mais e gastar mais chamadas de API, dependendo de quanto historico cada um tem.'
+                'Normalmente o scan "continua de onde parou" - mais rapido, nao repete nada. Marcando isso, o(s) chat(s) escolhido(s) sao relidos da primeira mensagem em diante de novo, mesmo que o scan ja tivesse chegado no fim. Util pra consertar um chat com suspeita de dado incompleto, ou pra preencher retroativamente um recurso novo (ex.: "Minhas reacoes") em chat ja escaneado antes dele existir. Com "Todos" selecionado, reescaneia TODOS os grupos/canais marcados em "Configurar grupos" do zero - pode levar horas em canal grande, e pede um segundo clique pra confirmar. Se parar no meio, o proximo scan normal continua o reescaneamento de onde parou (o ponto antigo ja foi zerado). As marcacoes de "ja visto" sao mantidas. A caixa desmarca sozinha ao sair desta tela.'
             );
         blocoForcarRescan.appendChild(checkboxForcarRescan.elemento);
         blocoForcarRescan.appendChild(labelForcarRescan);
@@ -171585,12 +172200,34 @@ window.TRP_VERSAO = "2026.10.13.2";
                 botaoIniciar.textContent = "Iniciar scan de novo";
                 botaoParar.style.display = "none";
                 selectGrupo.disabled = false;
-                const ultimasMensagensPosScan = await buscarUltimaMensagemPorChat().catch(() => new Map());
+                const ultimasMensagensPosScan = await buscarUltimaMensagemPorChat(true).catch(() => new Map());
                 await renderizarTabelaChats(tabela, db, ultimasMensagensPosScan);
             },
         });
 
+        // Reescanear TODOS do zero pode levar horas (ver HISTORICO_TECNICO.md
+        // v2026.10.13.1, canal com 468 mil mensagens) - pede um segundo
+        // clique em ate 5s, mesmo padrao do "Sair", sem confirm() nativo.
+        let confirmacaoRescanTodosPendente = false;
+        let timeoutConfirmacaoRescan = null;
+
         botaoIniciar.addEventListener("click", async () => {
+            if (checkboxForcarRescan.checked && !selectGrupo.value && !confirmacaoRescanTodosPendente) {
+                confirmacaoRescanTodosPendente = true;
+                const textoAnterior = botaoIniciar.textContent;
+                const fundoAnterior = botaoIniciar.style.background;
+                botaoIniciar.textContent = "Confirmar: reescanear TODOS do zero?";
+                botaoIniciar.style.background = "#a33";
+                timeoutConfirmacaoRescan = setTimeout(() => {
+                    confirmacaoRescanTodosPendente = false;
+                    botaoIniciar.textContent = textoAnterior;
+                    botaoIniciar.style.background = fundoAnterior;
+                }, 5000);
+                return;
+            }
+            confirmacaoRescanTodosPendente = false;
+            clearTimeout(timeoutConfirmacaoRescan);
+            botaoIniciar.style.background = "#4da3ff";
             botaoIniciar.disabled = true;
             botaoIniciar.textContent = "Escaneando...";
             botaoParar.style.display = "block";
@@ -171599,15 +172236,22 @@ window.TRP_VERSAO = "2026.10.13.2";
             try {
                 if (checkboxForcarRescan.checked) {
                     status.textContent = "Preparando reescaneamento completo...";
-                    await resetarCheckpointsParaRescanCompleto(db, apenasChatId);
+                    await resetarCheckpointsParaRescanCompleto(
+                        db,
+                        apenasChatId,
+                        apenasChatId ? null : carregarGruposExcluidos()
+                    );
                 }
-                await escanearTudo(apenasChatId);
+                const { gruposComErro } = await escanearTudo(apenasChatId);
                 notificarStatusScan(
-                    cancelarScanSolicitado
+                    (cancelarScanSolicitado
                         ? "Scan interrompido - o que ja foi visto fica salvo, pode retomar depois."
                         : apenasChatId
                         ? "Scan completo nesse grupo."
-                        : "Scan completo em todos os grupos/canais."
+                        : "Scan completo em todos os grupos/canais.") +
+                        (gruposComErro.length
+                            ? "\nPulados por erro do Telegram (" + gruposComErro.length + "): " + gruposComErro.join("; ")
+                            : "")
                 );
             } catch (erro) {
                 notificarStatusScan("Erro durante o scan: " + (erro && erro.message ? erro.message : erro));
@@ -171711,16 +172355,28 @@ window.TRP_VERSAO = "2026.10.13.2";
     // nova chamada de iterMessages com esses valores atualizados retoma do
     // lugar certo, nunca reprocessa nada); qualquer outro erro continua
     // propagando exatamente como sempre propagou.
+    // A cada quantas mensagens o scan grava checkpoint (e o lote de
+    // mensagens). Era 500; cada gravacao copia o indice inteiro, entao
+    // espacar reduz esse custo 4x. Se o navegador fechar no meio, perde no
+    // maximo isso de progresso (o proximo scan relê essas mensagens).
+    const INTERVALO_CHECKPOINT_SCAN = 2000;
+
     async function escanearTudo(apenasChatId) {
-        if (scanEmAndamento) return;
+        if (scanEmAndamento) return { gruposComErro: [] };
         scanEmAndamento = true;
         cancelarScanSolicitado = false;
-        const db = await abrirBanco();
         // So vale a exclusao quando "Todos" esta rodando - escolher um
         // grupo especifico (apenasChatId) sempre escaneia ele, mesmo que
         // esteja desmarcado em "Configurar grupos do scan".
         const excluidos = apenasChatId ? null : carregarGruposExcluidos();
+        const gruposComErro = [];
+        let db = null;
+        let limiteDeFloodOriginal = null;
         try {
+            // Dentro do try: se abrir a pasta falhar, o finally ainda solta
+            // scanEmAndamento (antes ficava preso em "Scan em andamento" ate
+            // recarregar a pagina).
+            db = await abrirBanco();
             // Materializa a lista inteira ANTES de comecar a escanear
             // qualquer chat (em vez de so consumir iterTodosOsDialogs() aos
             // poucos, no meio do laco) - e o que permite mostrar "grupo X de
@@ -171729,7 +172385,7 @@ window.TRP_VERSAO = "2026.10.13.2";
             // intercalado com o escaneamento de cada chat), nao faz nenhuma
             // chamada extra por grupo.
             const dialogsParaEscanear = [];
-            for await (const dialog of iterTodosOsDialogs()) {
+            for (const dialog of await listarDialogs(true)) {
                 if (!(dialog.isGroup || dialog.isChannel)) continue;
                 const chatId = String(dialog.id);
                 if (apenasChatId && chatId !== apenasChatId) continue;
@@ -171738,6 +172394,19 @@ window.TRP_VERSAO = "2026.10.13.2";
             }
             const totalDeGrupos = dialogsParaEscanear.length;
 
+            // Durante o scan, TODA pausa pedida pelo Telegram (flood wait)
+            // volta pra gente em vez de a biblioteca dormir em silencio por
+            // ate 60s (floodSleepThreshold padrao) - o laco de retry abaixo
+            // ja espera o mesmo tempo, mas mostrando contagem regressiva no
+            // status. Era a principal causa do "parece travado" sem nada na
+            // tela. Volta ao valor original no finally. Efeito colateral
+            // aceito: outra tela usada DURANTE o scan recebe erro de flood
+            // wait em vez de esperar sozinha.
+            if (cliente && "floodSleepThreshold" in cliente) {
+                limiteDeFloodOriginal = cliente.floodSleepThreshold;
+                cliente.floodSleepThreshold = 0;
+            }
+
             for (let indiceGrupo = 0; indiceGrupo < totalDeGrupos; indiceGrupo++) {
                 if (cancelarScanSolicitado) break;
                 const dialog = dialogsParaEscanear[indiceGrupo];
@@ -171745,206 +172414,738 @@ window.TRP_VERSAO = "2026.10.13.2";
                 // escaneando um grupo especifico (apenasChatId, lista
                 // sempre com 1 item so) "grupo 1 de 1" so seria ruido.
                 const prefixoGrupo = totalDeGrupos > 1 ? `(grupo ${indiceGrupo + 1} de ${totalDeGrupos}) ` : "";
+                const tituloParaErro = dialog.title || dialog.name || String(dialog.id);
 
-                const chatId = String(dialog.id);
-                const chatTitle = dialog.title || dialog.name || chatId;
-                const chatUsername = (dialog.entity && dialog.entity.username) || null;
+                // Erro do Telegram que so afeta ESTE chat (ex.: CHANNEL_PRIVATE
+                // depois de sair/ser removido do grupo) nao derruba mais o scan
+                // inteiro: antes, um unico grupo assim parava o "Todos" sempre no
+                // mesmo ponto, e os grupos depois dele nunca eram escaneados. O
+                // checkpoint desse chat fica como estava (nao avanca), entao nada
+                // se perde. Erro de rede/disco continua parando o scan (ver
+                // erroSoDesteChat).
+                try {
 
-                const chatSalvo = await buscarChat(db, chatId);
+                    const chatId = String(dialog.id);
+                    const chatTitle = dialog.title || dialog.name || chatId;
+                    const chatUsername = (dialog.entity && dialog.entity.username) || null;
 
-                let backfillAlvo = 0;
-                let textoCompletoAte = 0;
-                if (chatSalvo) {
-                    if (typeof chatSalvo.backfillAlvo === "number") {
-                        backfillAlvo = chatSalvo.backfillAlvo;
-                        textoCompletoAte = chatSalvo.textoCompletoAte || 0;
-                    } else {
-                        // chat ja existia de antes dessa funcionalidade -
-                        // assume o pior caso (nenhum texto completo do
-                        // historico antigo foi salvo ainda)
-                        backfillAlvo = chatSalvo.lastScannedMessageId || 0;
-                        textoCompletoAte = 0;
+                    const chatSalvo = await buscarChat(db, chatId);
+
+                    let backfillAlvo = 0;
+                    let textoCompletoAte = 0;
+                    if (chatSalvo) {
+                        if (typeof chatSalvo.backfillAlvo === "number") {
+                            backfillAlvo = chatSalvo.backfillAlvo;
+                            textoCompletoAte = chatSalvo.textoCompletoAte || 0;
+                        } else {
+                            // chat ja existia de antes dessa funcionalidade -
+                            // assume o pior caso (nenhum texto completo do
+                            // historico antigo foi salvo ainda)
+                            backfillAlvo = chatSalvo.lastScannedMessageId || 0;
+                            textoCompletoAte = 0;
+                        }
                     }
-                }
-                let lastScannedMessageId = (chatSalvo && chatSalvo.lastScannedMessageId) || 0;
-                let cancelado = false;
-                const inicio = Date.now();
+                    let lastScannedMessageId = (chatSalvo && chatSalvo.lastScannedMessageId) || 0;
+                    let cancelado = false;
+                    const inicio = Date.now();
 
-                console.log("[Gestor TLGR] scan:", {
-                    chatTitle,
-                    chatId,
-                    backfillAlvo,
-                    textoCompletoAte,
-                    lastScannedMessageId,
-                });
-
-                const salvarCheckpoint = async (concluido) => {
-                    await salvarChat(db, {
-                        chatId,
+                    console.log("[Gestor TLGR] scan:", {
                         chatTitle,
-                        chatUsername,
-                        lastScannedMessageId,
-                        lastScannedAt: new Date().toISOString(),
-                        concluido,
+                        chatId,
                         backfillAlvo,
                         textoCompletoAte,
+                        lastScannedMessageId,
                     });
-                    await notificarAtualizacaoChatScan();
-                };
 
-                // ---- Fase 1: backfill automatico do historico antigo ----
-                if (textoCompletoAte < backfillAlvo) {
-                    let totalVistas = 0;
-                    // Alvo fixo e conhecido (backfillAlvo) - diferente da
-                    // fase 2, da pra calcular o percentual exato aqui, sem
-                    // depender de estimativa nenhuma.
-                    const inicioBackfillAte = textoCompletoAte;
-                    const extensaoBackfill = Math.max(1, backfillAlvo - inicioBackfillAte);
-                    notificarStatusScan(
-                        `${prefixoGrupo}${chatTitle}: completando historico antigo (mensagem ${textoCompletoAte} ate ${backfillAlvo})...`
-                    );
-                    while (true) {
-                        try {
-                            for await (const mensagem of cliente.iterMessages(dialog.entity, {
-                                minId: textoCompletoAte,
-                                maxId: backfillAlvo + 1,
-                                reverse: true,
-                            })) {
+                    // Grava as mensagens pendentes ANTES do checkpoint - nunca o
+                    // contrario (ver "Gravacao em lote" perto de abrirBanco).
+                    //
+                    // No meio do chat o checkpoint roda SEM o scan esperar
+                    // (salvarCheckpointEmParalelo): a gravacao em disco (que
+                    // copia o indice inteiro, ver medicao no historico) corre
+                    // enquanto o scan ja busca as proximas mensagens na rede.
+                    // A ordem continua garantida: o lote de mensagens e
+                    // separado na hora da chamada (descarregarEscritasPendentes
+                    // troca o Map antes do primeiro await), cada checkpoint so
+                    // grava chats.json depois do proprio lote E do checkpoint
+                    // anterior, e os valores do checkpoint sao copiados na hora.
+                    // Erro numa gravacao em paralelo e relancado no proximo
+                    // checkpoint ou no fim do chat.
+                    let checkpointsEmCurso = Promise.resolve();
+                    let erroDeCheckpoint = null;
+                    const salvarCheckpointEmParalelo = (concluido) => {
+                        if (erroDeCheckpoint) throw erroDeCheckpoint;
+                        const registro = {
+                            chatId,
+                            chatTitle,
+                            chatUsername,
+                            lastScannedMessageId,
+                            lastScannedAt: new Date().toISOString(),
+                            concluido,
+                            backfillAlvo,
+                            textoCompletoAte,
+                        };
+                        const gravacaoDoLote = descarregarEscritasPendentes(db);
+                        checkpointsEmCurso = Promise.all([checkpointsEmCurso, gravacaoDoLote])
+                            .then(() => salvarChat(db, registro))
+                            .then(() => notificarAtualizacaoChatScan())
+                            .catch((erro) => {
+                                erroDeCheckpoint = erroDeCheckpoint || erro;
+                            });
+                    };
+                    const salvarCheckpoint = async (concluido) => {
+                        salvarCheckpointEmParalelo(concluido);
+                        await checkpointsEmCurso;
+                        if (erroDeCheckpoint) throw erroDeCheckpoint;
+                    };
+
+                    // ---- Fase 1: backfill automatico do historico antigo ----
+                    if (textoCompletoAte < backfillAlvo) {
+                        let totalVistas = 0;
+                        // Alvo fixo e conhecido (backfillAlvo) - diferente da
+                        // fase 2, da pra calcular o percentual exato aqui, sem
+                        // depender de estimativa nenhuma.
+                        const inicioBackfillAte = textoCompletoAte;
+                        const extensaoBackfill = Math.max(1, backfillAlvo - inicioBackfillAte);
+                        notificarStatusScan(
+                            `${prefixoGrupo}${chatTitle}: completando historico antigo (mensagem ${textoCompletoAte} ate ${backfillAlvo})...`
+                        );
+                        while (true) {
+                            try {
+                                for await (const mensagem of cliente.iterMessages(dialog.entity, {
+                                    minId: textoCompletoAte,
+                                    maxId: backfillAlvo + 1,
+                                    reverse: true,
+                                })) {
+                                    if (cancelarScanSolicitado) {
+                                        cancelado = true;
+                                        break;
+                                    }
+                                    totalVistas++;
+                                    textoCompletoAte = mensagem.id;
+
+                                    await salvarMensagem(db, montarRegistroDoScan(db, chatId, chatTitle, mensagem), {
+                                        adiarGravacao: true,
+                                    });
+
+                                    // Texto da tela (so' custa um textContent)
+                                    // atualiza bem mais seguido que o checkpoint
+                                    // salvo no disco (esse sim grava arquivo) -
+                                    // antes os dois estavam juntos
+                                    // a cada 500 mensagens, o que podia deixar a
+                                    // tela parecendo travada por muito tempo
+                                    // entre uma atualizacao e outra.
+                                    if (totalVistas % 100 === 0) {
+                                        const segundos = Math.round((Date.now() - inicio) / 1000);
+                                        const percentual = Math.min(
+                                            100,
+                                            Math.round(((textoCompletoAte - inicioBackfillAte) / extensaoBackfill) * 100)
+                                        );
+                                        notificarStatusScan(
+                                            `${prefixoGrupo}${chatTitle}: completando historico antigo, mensagem ${textoCompletoAte} de ${backfillAlvo} (~${percentual}%) (${segundos}s)...`
+                                        );
+                                    }
+                                    if (totalVistas % INTERVALO_CHECKPOINT_SCAN === 0) {
+                                        salvarCheckpointEmParalelo(false);
+                                    }
+                                }
+                                break; // for-await terminou sem erro (cancelado ja foi tratado acima)
+                            } catch (erro) {
+                                if (!(await aguardarFloodWaitLongoSeForOCaso(erro))) throw erro;
                                 if (cancelarScanSolicitado) {
                                     cancelado = true;
+                                    break; // usuario cancelou enquanto esperava o flood wait passar
+                                }
+                                // espera terminou sem cancelar - volta pro topo
+                                // do while e refaz iterMessages a partir de
+                                // textoCompletoAte atualizado, sem reprocessar
+                                // nada que ja foi salvo
+                            }
+                        }
+                        await salvarCheckpoint(false);
+                    }
+
+                    if (cancelado) continue; // backfill ficou parcial - termina na proxima vez antes de seguir pra mensagem nova
+
+                    // ---- Fase 2: scan incremental normal (so mensagem nova) ----
+                    notificarStatusScan(`${prefixoGrupo}Escaneando: ${chatTitle} (a partir da mensagem ${lastScannedMessageId})...`);
+                    let totalVistas = 0;
+                    let comReacao = 0;
+                    let terminouSemCancelar = true;
+
+                    while (true) {
+                        try {
+                            const iteradorScan = cliente.iterMessages(dialog.entity, {
+                                minId: lastScannedMessageId,
+                                reverse: true,
+                            });
+                            for await (const mensagem of iteradorScan) {
+                                if (cancelarScanSolicitado) {
+                                    terminouSemCancelar = false;
                                     break;
                                 }
                                 totalVistas++;
-                                textoCompletoAte = mensagem.id;
+                                lastScannedMessageId = Math.max(lastScannedMessageId, mensagem.id);
 
-                                const { reactions, total, minhasReacoes } = extrairReacoes(mensagem);
-                                await salvarMensagem(db, {
-                                    key: chatId + ":" + mensagem.id,
-                                    chatId,
-                                    messageId: mensagem.id,
-                                    dateUtc: dataIso(mensagem),
-                                    texto: textoCompleto(mensagem),
-                                    reactionTotal: total,
-                                    reactions,
-                                    minhasReacoes,
-                                    chatTitle,
-                                });
+                                // Salva toda mensagem, nao so as com reacao - o
+                                // texto completo de tudo e o que permite a busca
+                                // por palavra-chave (tela "Buscar mensagens").
+                                // reactionTotal fica 0 quando nao tem reacao, e
+                                // o ranking de "top reacoes" continua filtrando
+                                // por ele normalmente.
+                                const registro = montarRegistroDoScan(db, chatId, chatTitle, mensagem);
+                                await salvarMensagem(db, registro, { adiarGravacao: true });
+                                if (registro.reactionTotal > 0) comReacao++;
 
-                                // Texto da tela (so' custa um textContent)
-                                // atualiza bem mais seguido que o checkpoint
-                                // salvo no banco (esse sim tem custo de
-                                // IndexedDB) - antes os dois estavam juntos
-                                // a cada 500 mensagens, o que podia deixar a
-                                // tela parecendo travada por muito tempo
-                                // entre uma atualizacao e outra.
+                                // Ver comentario equivalente na fase 1: texto da
+                                // tela atualiza mais seguido (so' custa
+                                // textContent) que o checkpoint no disco (esse
+                                // sim grava arquivo).
                                 if (totalVistas % 100 === 0) {
                                     const segundos = Math.round((Date.now() - inicio) / 1000);
-                                    const percentual = Math.min(
-                                        100,
-                                        Math.round(((textoCompletoAte - inicioBackfillAte) / extensaoBackfill) * 100)
-                                    );
                                     notificarStatusScan(
-                                        `${prefixoGrupo}${chatTitle}: completando historico antigo, mensagem ${textoCompletoAte} de ${backfillAlvo} (~${percentual}%) (${segundos}s)...`
+                                        `${prefixoGrupo}${chatTitle}: mensagem ${lastScannedMessageId}${formatarProgressoAproximado(
+                                            lastScannedMessageId,
+                                            iteradorScan.total
+                                        )}, ${totalVistas} verificadas (${segundos}s), ${comReacao} com reacao...`
                                     );
                                 }
-                                if (totalVistas % 500 === 0) {
-                                    await salvarCheckpoint(false);
+                                if (totalVistas % INTERVALO_CHECKPOINT_SCAN === 0) {
+                                    salvarCheckpointEmParalelo(false);
                                 }
                             }
                             break; // for-await terminou sem erro (cancelado ja foi tratado acima)
                         } catch (erro) {
                             if (!(await aguardarFloodWaitLongoSeForOCaso(erro))) throw erro;
                             if (cancelarScanSolicitado) {
-                                cancelado = true;
+                                terminouSemCancelar = false;
                                 break; // usuario cancelou enquanto esperava o flood wait passar
                             }
-                            // espera terminou sem cancelar - volta pro topo
-                            // do while e refaz iterMessages a partir de
-                            // textoCompletoAte atualizado, sem reprocessar
+                            // espera terminou sem cancelar - volta pro topo do
+                            // while e refaz iterMessages a partir de
+                            // lastScannedMessageId atualizado, sem reprocessar
                             // nada que ja foi salvo
                         }
                     }
-                    await salvarCheckpoint(false);
+
+                    await salvarCheckpoint(terminouSemCancelar);
+                } catch (erro) {
+                    if (!erroSoDesteChat(erro)) throw erro;
+                    console.warn("[Gestor TLGR] scan: pulando chat por erro do Telegram", tituloParaErro, erro);
+                    gruposComErro.push(tituloParaErro + " (" + erro.errorMessage + ")");
+                    notificarStatusScan(`${prefixoGrupo}${tituloParaErro}: pulado (${erro.errorMessage}), seguindo pro proximo...`);
                 }
-
-                if (cancelado) continue; // backfill ficou parcial - termina na proxima vez antes de seguir pra mensagem nova
-
-                // ---- Fase 2: scan incremental normal (so mensagem nova) ----
-                notificarStatusScan(`${prefixoGrupo}Escaneando: ${chatTitle} (a partir da mensagem ${lastScannedMessageId})...`);
-                let totalVistas = 0;
-                let comReacao = 0;
-                let terminouSemCancelar = true;
-
-                while (true) {
-                    try {
-                        const iteradorScan = cliente.iterMessages(dialog.entity, {
-                            minId: lastScannedMessageId,
-                            reverse: true,
-                        });
-                        for await (const mensagem of iteradorScan) {
-                            if (cancelarScanSolicitado) {
-                                terminouSemCancelar = false;
-                                break;
-                            }
-                            totalVistas++;
-                            lastScannedMessageId = Math.max(lastScannedMessageId, mensagem.id);
-
-                            const { reactions, total, minhasReacoes } = extrairReacoes(mensagem);
-                            // Salva toda mensagem, nao so as com reacao - o
-                            // texto completo de tudo e o que permite a busca
-                            // por palavra-chave (tela "Buscar mensagens").
-                            // reactionTotal fica 0 quando nao tem reacao, e
-                            // o ranking de "top reacoes" continua filtrando
-                            // por ele normalmente.
-                            await salvarMensagem(db, {
-                                key: chatId + ":" + mensagem.id,
-                                chatId,
-                                messageId: mensagem.id,
-                                dateUtc: dataIso(mensagem),
-                                texto: textoCompleto(mensagem),
-                                reactionTotal: total,
-                                reactions,
-                                minhasReacoes,
-                                chatTitle,
-                            });
-                            if (total > 0) comReacao++;
-
-                            // Ver comentario equivalente na fase 1: texto da
-                            // tela atualiza mais seguido (so' custa
-                            // textContent) que o checkpoint no banco (esse
-                            // sim tem custo de IndexedDB).
-                            if (totalVistas % 100 === 0) {
-                                const segundos = Math.round((Date.now() - inicio) / 1000);
-                                notificarStatusScan(
-                                    `${prefixoGrupo}${chatTitle}: mensagem ${lastScannedMessageId}${formatarProgressoAproximado(
-                                        lastScannedMessageId,
-                                        iteradorScan.total
-                                    )}, ${totalVistas} verificadas (${segundos}s), ${comReacao} com reacao...`
-                                );
-                            }
-                            if (totalVistas % 500 === 0) {
-                                await salvarCheckpoint(false);
-                            }
-                        }
-                        break; // for-await terminou sem erro (cancelado ja foi tratado acima)
-                    } catch (erro) {
-                        if (!(await aguardarFloodWaitLongoSeForOCaso(erro))) throw erro;
-                        if (cancelarScanSolicitado) {
-                            terminouSemCancelar = false;
-                            break; // usuario cancelou enquanto esperava o flood wait passar
-                        }
-                        // espera terminou sem cancelar - volta pro topo do
-                        // while e refaz iterMessages a partir de
-                        // lastScannedMessageId atualizado, sem reprocessar
-                        // nada que ja foi salvo
-                    }
-                }
-
-                await salvarCheckpoint(terminouSemCancelar);
             }
+            return { gruposComErro };
         } finally {
+            // Garante que nada fica so em memoria se o scan parar por erro.
+            // Gravar mensagem sem avancar o checkpoint e inofensivo (o
+            // proximo scan regrava as mesmas, "ultima linha vence").
+            if (db) await descarregarEscritasPendentes(db).catch((erro) => console.warn("[Gestor TLGR] erro ao gravar pendentes", erro));
+            if (limiteDeFloodOriginal !== null && cliente) cliente.floodSleepThreshold = limiteDeFloodOriginal;
             scanEmAndamento = false;
         }
+    }
+
+    // Erro RPC do Telegram com codigo 400/403/406 (pedido invalido pra esse
+    // chat, sem permissao, etc.) - afeta so o chat atual. 401 (sessao),
+    // 420 (flood, tratado a parte), 5xx (servidor) e erros sem
+    // errorMessage (rede caiu, disco) nao entram aqui.
+    function erroSoDesteChat(erro) {
+        return !!erro && typeof erro.errorMessage === "string" && [400, 403, 406].includes(erro.code);
+    }
+
+    // ---- Pecas compartilhadas das listas de mensagem (rodada 4) ----
+    //
+    // Top reacoes, Minhas reacoes, Buscar mensagens, Monitorados e
+    // Favoritos usam as mesmas pecas: filtros ligados as preferencias
+    // (ficam como o usuario deixou, ver preferencias.js), item de mensagem
+    // (visto, favorito, autor, reacoes por emoji, "Monitorar autor") e a
+    // lista com "Mostrar mais". Antes eram tres copias quase iguais.
+
+    const ESTILO_CAMPO =
+        "background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:6px;box-sizing:border-box;";
+    const ESTILO_BOTAO_PEQUENO =
+        "background:#2a2f3a;border:none;border-radius:6px;color:#e6e8ec;cursor:pointer;font-size:11px;padding:4px 8px;";
+
+    function botaoPequeno(container, texto, aoClicar, estiloExtra) {
+        const botao = document.createElement("button");
+        botao.textContent = texto;
+        botao.style.cssText = ESTILO_BOTAO_PEQUENO + (estiloExtra || "");
+        if (aoClicar) botao.addEventListener("click", aoClicar);
+        container.appendChild(botao);
+        return botao;
+    }
+
+    function rotuloDoEmoji(emoji) {
+        if (emoji === "custom") return "(emoji personalizado)";
+        if (emoji === "estrela") return "(estrela paga)";
+        return emoji;
+    }
+
+    function textoDasReacoes(m) {
+        return (m.emojis || [])
+            .slice(0, 8)
+            .map(([emoji, quantos]) => rotuloDoEmoji(emoji) + " " + quantos)
+            .join("  ");
+    }
+
+    // Nome de quem mandou, pelo remetentes.json (sem chamada ao Telegram).
+    function nomeDoAutor(db, de) {
+        if (!de) return "";
+        const dados = db && db.remetentes && db.remetentes.get(de);
+        if (dados) return dados.n + (dados.u ? " (@" + dados.u + ")" : "");
+        return String(de).startsWith("-") ? "canal/grupo " + de : "pessoa " + de;
+    }
+
+    // Emojis que aparecem no indice, do mais usado pro menos (filtro "so
+    // com esta reacao"). Uma passada no indice em memoria por abertura de tela.
+    function emojisMaisUsados(db, limite) {
+        const contagem = new Map();
+        for (const valor of db.indice.values()) {
+            for (const par of valor.emojis || []) contagem.set(par[0], (contagem.get(par[0]) || 0) + par[1]);
+        }
+        return [...contagem.entries()].sort((a, b) => b[1] - a[1]).slice(0, limite || 40).map((par) => par[0]);
+    }
+
+    const TIPOS_DE_MIDIA_FILTRO = [
+        { valor: "", rotulo: "Qualquer tipo" },
+        { valor: "foto", rotulo: "Com foto" },
+        { valor: "video", rotulo: "Com video" },
+        { valor: "audio", rotulo: "Com audio" },
+        { valor: "arquivo", rotulo: "Com arquivo" },
+        { valor: "sem", rotulo: "So texto" },
+    ];
+
+    // Grupo, (ordenar), (minimo), periodo, reacao, tipo de midia - todos
+    // ligados as preferencias "<prefixo>_...". Devolve os campos e
+    // filtros() com o valor atual de todos.
+    function montarFiltrosDeLista(corpo, db, chats, prefixo, { ordenar, minimo, rotuloMinimo }, aoMudar) {
+        const linha1 = document.createElement("div");
+        linha1.style.cssText = "display:flex;gap:8px;margin-bottom:8px;";
+        const selectGrupo = document.createElement("select");
+        selectGrupo.style.cssText = ESTILO_CAMPO + "flex:2;min-width:0;";
+        selectGrupo.innerHTML = '<option value="">Todos os grupos</option>';
+        for (const c of chats) {
+            const opcao = document.createElement("option");
+            opcao.value = c.chatId;
+            opcao.textContent = c.chatTitle || c.chatId;
+            selectGrupo.appendChild(opcao);
+        }
+        linha1.appendChild(selectGrupo);
+        ligarCampoAPreferencia(selectGrupo, prefixo + "_grupo");
+        let selectOrdenar = null;
+        if (ordenar) {
+            selectOrdenar = document.createElement("select");
+            selectOrdenar.style.cssText = ESTILO_CAMPO + "flex:1;min-width:0;";
+            selectOrdenar.innerHTML = '<option value="reacoes">Mais reacoes</option><option value="data">Mais recentes</option>';
+            linha1.appendChild(selectOrdenar);
+            ligarCampoAPreferencia(selectOrdenar, prefixo + "_ordenar");
+        }
+        let inputMinimo = null;
+        if (minimo) {
+            inputMinimo = document.createElement("input");
+            inputMinimo.type = "number";
+            inputMinimo.min = "0";
+            inputMinimo.title = rotuloMinimo || "Minimo de reacoes";
+            inputMinimo.style.cssText = ESTILO_CAMPO + "width:64px;flex-shrink:0;";
+            linha1.appendChild(inputMinimo);
+            ligarCampoAPreferencia(inputMinimo, prefixo + "_minimo");
+        }
+        corpo.appendChild(linha1);
+
+        const linha2 = document.createElement("div");
+        linha2.style.cssText = "display:flex;gap:8px;margin-bottom:8px;";
+        const campoData = (rotulo, nome) => {
+            const bloco = document.createElement("div");
+            bloco.style.cssText = "flex:1;";
+            const label = document.createElement("label");
+            label.style.cssText = "display:block;color:#8b92a3;font-size:11px;margin-bottom:2px;";
+            label.textContent = rotulo;
+            const input = document.createElement("input");
+            input.type = "date";
+            input.style.cssText = ESTILO_CAMPO + "width:100%;";
+            bloco.appendChild(label);
+            bloco.appendChild(input);
+            linha2.appendChild(bloco);
+            return ligarCampoAPreferencia(input, nome);
+        };
+        const inputDataDe = campoData("De (data)", prefixo + "_data_de");
+        const inputDataAte = campoData("Ate (data)", prefixo + "_data_ate");
+        corpo.appendChild(linha2);
+
+        const linha3 = document.createElement("div");
+        linha3.style.cssText = "display:flex;gap:8px;margin-bottom:8px;";
+        const selectEmoji = document.createElement("select");
+        selectEmoji.style.cssText = ESTILO_CAMPO + "flex:1;min-width:0;";
+        selectEmoji.title = "So mensagens com esta reacao (mensagens escaneadas a partir desta versao)";
+        selectEmoji.innerHTML = '<option value="">Qualquer reacao</option>';
+        for (const emoji of emojisMaisUsados(db)) {
+            const opcao = document.createElement("option");
+            opcao.value = emoji;
+            opcao.textContent = "So com " + rotuloDoEmoji(emoji);
+            selectEmoji.appendChild(opcao);
+        }
+        const emojiSalvo = lerPreferencia(prefixo + "_emoji");
+        if (emojiSalvo && ![...selectEmoji.options].some((o) => o.value === emojiSalvo)) {
+            const opcao = document.createElement("option");
+            opcao.value = emojiSalvo;
+            opcao.textContent = "So com " + rotuloDoEmoji(emojiSalvo);
+            selectEmoji.appendChild(opcao);
+        }
+        ligarCampoAPreferencia(selectEmoji, prefixo + "_emoji");
+        const selectMidia = document.createElement("select");
+        selectMidia.style.cssText = ESTILO_CAMPO + "flex:1;min-width:0;";
+        for (const tipo of TIPOS_DE_MIDIA_FILTRO) {
+            const opcao = document.createElement("option");
+            opcao.value = tipo.valor;
+            opcao.textContent = tipo.rotulo;
+            selectMidia.appendChild(opcao);
+        }
+        ligarCampoAPreferencia(selectMidia, prefixo + "_midia");
+        linha3.appendChild(selectEmoji);
+        linha3.appendChild(selectMidia);
+        linha3.insertAdjacentHTML(
+            "beforeend",
+            criarIconeInfoHtml(
+                "Reacao e tipo de midia so existem nas mensagens escaneadas a partir da versao 2026.10.14.3 (ou atualizadas pelo botao Atualizar reacoes). Mensagem salva antes disso nao passa nesses dois filtros ate o grupo ser escaneado de novo."
+            )
+        );
+        corpo.appendChild(linha3);
+
+        for (const campo of [selectGrupo, selectOrdenar, inputMinimo, inputDataDe, inputDataAte, selectEmoji, selectMidia]) {
+            if (campo) campo.addEventListener("change", aoMudar);
+        }
+        return {
+            selectGrupo,
+            filtros() {
+                return {
+                    chatId: selectGrupo.value || null,
+                    ordenarPor: selectOrdenar ? selectOrdenar.value : null,
+                    minimo: inputMinimo ? parseInt(inputMinimo.value, 10) || 0 : 0,
+                    dataDe: inputDataDe.value || null,
+                    dataAte: inputDataAte.value || null,
+                    emoji: selectEmoji.value || null,
+                    midia: selectMidia.value || null,
+                };
+            },
+            nomes: [prefixo + "_grupo", prefixo + "_ordenar", prefixo + "_minimo", prefixo + "_data_de", prefixo + "_data_ate", prefixo + "_emoji", prefixo + "_midia"].filter((n) => PREFERENCIAS.has(n)),
+        };
+    }
+
+    // "Limpar filtros": volta os filtros desta tela ao padrao e redesenha.
+    function botaoLimparFiltros(container, nomes, reabrir) {
+        return botaoPequeno(container, "Limpar filtros", () => {
+            for (const nome of nomes) gravarPreferencia(nome, PREFERENCIAS.get(nome).padrao);
+            reabrir();
+        });
+    }
+
+    // Um item de mensagem. opcoes: titulo, texto, tamanhoTexto, novo (destaque
+    // "novo" dos Monitorados), faltando (lista onde o item se registra se o
+    // texto precisar ser lido do arquivo do chat), semMonitorar.
+    function criarItemDeMensagem(db, m, opcoes) {
+        const item = document.createElement("div");
+        item.style.cssText =
+            "padding:8px 0;border-bottom:1px solid #2a2f3a;display:flex;gap:8px;align-items:flex-start;" +
+            (m.visto ? "opacity:0.55;" : "") +
+            (opcoes.novo ? "border-left:3px solid #e0a93a;padding-left:6px;" : "");
+        item.dataset.key = m.key;
+        const quadrado = criarQuadradoMarcavel(m.visto, (novoValor) => {
+            marcarVisto(db, m.key, novoValor).catch((erro) => console.warn("[Gestor TLGR] marcar visto:", erro));
+            item.style.opacity = novoValor ? "0.55" : "1";
+        });
+        quadrado.elemento.title = "Marcar como visto";
+        // "Visto" fica no indice: mensagem que nao esta salva (conversa fora
+        // do scan, favorito de mensagem que sumiu) nao tem onde guardar - a
+        // caixinha nem aparece (antes marcava e sumia na proxima tela).
+        if (!db.indice.has(m.key)) quadrado.elemento.style.visibility = "hidden";
+        item.appendChild(quadrado.elemento);
+
+        const conteudo = document.createElement("div");
+        conteudo.style.cssText = "flex:1;min-width:0;";
+        const link = criarLinkExterno((opcoes.novo ? "[novo] " : "") + opcoes.titulo, urlDaMensagem(m), "color:#4da3ff;font-weight:600;display:block;");
+        conteudo.appendChild(link);
+        const meta = document.createElement("div");
+        meta.style.cssText = "color:#8b92a3;font-size:11px;";
+        const partes = [m.chatTitle || m.chatId];
+        if (m.de && m.de !== m.chatId) partes.push("por " + nomeDoAutor(db, m.de));
+        else if (m.de && m.de === m.chatId) partes.push(m.assinatura ? "por " + m.assinatura + " (assinatura)" : "pelo proprio grupo/canal (admin anonimo ou post do canal)");
+        const reacoes = textoDasReacoes(m);
+        if (reacoes) partes.push(reacoes);
+        if (m.achadoNoServidor) partes.push("achado ao vivo no servidor, salvo agora");
+        meta.textContent = partes.join(" - ");
+        conteudo.appendChild(meta);
+        const texto = document.createElement("div");
+        const tamanho = opcoes.tamanhoTexto || 200;
+        const textoConhecido = opcoes.texto != null ? opcoes.texto : m.texto || m.trecho || m.textPreview || "";
+        if (textoConhecido) texto.textContent = truncar(textoConhecido, tamanho);
+        else if (opcoes.faltando) {
+            texto.textContent = "(carregando texto...)";
+            texto.style.color = "#8b92a3";
+            opcoes.faltando.push({ elemento: texto, key: m.key, chatId: m.chatId, tamanho });
+        }
+        conteudo.appendChild(texto);
+
+        const acoes = document.createElement("div");
+        acoes.style.cssText = "display:flex;gap:6px;margin-top:4px;flex-wrap:wrap;";
+        const favorito = ehFavorito(db, m.key);
+        const botaoFavorito = botaoPequeno(acoes, favorito ? "Favorito (tirar)" : "Favoritar", async () => {
+            const agora = await alternarFavorito(db, m, textoConhecido);
+            botaoFavorito.textContent = agora ? "Favorito (tirar)" : "Favoritar";
+            botaoFavorito.style.color = agora ? "#e0a93a" : "#e6e8ec";
+        });
+        botaoFavorito.style.color = favorito ? "#e0a93a" : "#e6e8ec";
+        if (!opcoes.semMonitorar && m.de !== m.chatId) {
+            const jaMonitorado = m.de && estaMonitorado(m.de);
+            const botaoMonitorar = botaoPequeno(acoes, jaMonitorado ? "Autor ja monitorado" : "Monitorar autor", async () => {
+                botaoMonitorar.disabled = true;
+                botaoMonitorar.textContent = "Conferindo autor...";
+                try {
+                    botaoMonitorar.textContent = await monitorarAutorDaMensagem(db, m);
+                } catch (erro) {
+                    botaoMonitorar.textContent = "Nao deu: " + mensagemDoErro(erro);
+                    botaoMonitorar.disabled = false;
+                }
+            });
+            if (jaMonitorado) botaoMonitorar.disabled = true;
+        }
+        conteudo.appendChild(acoes);
+        item.appendChild(conteudo);
+        return item;
+    }
+
+    // Texto das mensagens que so tem o indice (sem trecho): le o arquivo do
+    // chat (com o cache de sempre) so pros itens que estao na tela.
+    async function preencherTrechosQueFaltam(db, faltando) {
+        const porChat = new Map();
+        for (const pedido of faltando) {
+            if (!porChat.has(pedido.chatId)) porChat.set(pedido.chatId, []);
+            porChat.get(pedido.chatId).push(pedido);
+        }
+        for (const [chatId, pedidos] of porChat) {
+            let mapa = null;
+            try {
+                mapa = await obterMensagensCompletasDoChat(db, chatId);
+            } catch (erro) {
+                mapa = new Map();
+            }
+            for (const pedido of pedidos) {
+                const registro = mapa.get(pedido.key);
+                pedido.elemento.style.color = "";
+                pedido.elemento.textContent = registro ? truncar(registro.texto || "", pedido.tamanho) : "(texto nao esta salvo)";
+            }
+        }
+    }
+
+    // Lista com "Carregando...", "Mostrar mais", so a busca mais recente
+    // desenhando e sem esvaziar a lista no meio (ver HISTORICO, salto de
+    // rolagem). buscar(limite) -> { mensagens, temMais, avisos: [{texto, cor}] }.
+    function criarListaDeMensagens(corpo, db, { buscar, ocultarVistos, montarItem, passo, vazio, agruparPorGrupo }) {
+        const status = document.createElement("div");
+        status.style.cssText = "color:#8b92a3;font-size:11px;min-height:14px;margin-bottom:4px;white-space:pre-line;";
+        corpo.appendChild(status);
+        const lista = document.createElement("div");
+        corpo.appendChild(lista);
+        let limite = passo();
+        let numeroAtual = 0;
+        async function atualizar(reiniciar) {
+            if (reiniciar) limite = passo();
+            const meu = ++numeroAtual;
+            if (!lista.childNodes.length) lista.innerHTML = '<div style="color:#8b92a3;">Carregando...</div>';
+            status.textContent = "Carregando...";
+            let resultado;
+            try {
+                resultado = await buscar(limite, (texto) => {
+                    if (meu === numeroAtual) status.textContent = texto;
+                });
+            } catch (erro) {
+                if (meu !== numeroAtual) return;
+                status.textContent = "";
+                lista.innerHTML = "";
+                const aviso = document.createElement("div");
+                aviso.style.color = "#ff6b6b";
+                aviso.textContent = "Erro: " + mensagemDoErro(erro);
+                lista.appendChild(aviso);
+                return;
+            }
+            if (meu !== numeroAtual) return;
+            status.textContent = "";
+            const mensagens = resultado.mensagens;
+            const visiveis = ocultarVistos() ? mensagens.filter((m) => !m.visto) : mensagens;
+            const fragmento = document.createDocumentFragment();
+            for (const aviso of resultado.avisos || []) {
+                const div = document.createElement("div");
+                div.style.cssText = "font-size:11px;margin-bottom:6px;color:" + (aviso.cor || "#8b92a3") + ";";
+                div.textContent = aviso.texto;
+                fragmento.appendChild(div);
+            }
+            const faltando = [];
+            if (!mensagens.length) {
+                const div = document.createElement("div");
+                div.style.color = "#8b92a3";
+                div.textContent = vazio;
+                fragmento.appendChild(div);
+            } else if (!visiveis.length) {
+                const div = document.createElement("div");
+                div.style.color = "#8b92a3";
+                div.textContent = "Todas as mensagens desse filtro ja foram marcadas como vistas.";
+                fragmento.appendChild(div);
+            } else if (agruparPorGrupo && agruparPorGrupo() && visiveis.some((m) => m.chatId !== visiveis[0].chatId)) {
+                for (const grupo of agruparPorChat(visiveis)) {
+                    const cabecalho = document.createElement("div");
+                    cabecalho.style.cssText =
+                        "display:flex;align-items:center;gap:6px;padding:6px 0;cursor:pointer;user-select:none;color:#8b92a3;font-weight:600;font-size:12px;border-top:1px solid #2a2f3a;margin-top:4px;";
+                    cabecalho.textContent = "▾ " + grupo.chatTitle + " (" + grupo.itens.length + ")";
+                    const itens = document.createElement("div");
+                    cabecalho.addEventListener("click", () => {
+                        const aberto = itens.style.display !== "none";
+                        itens.style.display = aberto ? "none" : "block";
+                        cabecalho.textContent = (aberto ? "▸ " : "▾ ") + grupo.chatTitle + " (" + grupo.itens.length + ")";
+                    });
+                    fragmento.appendChild(cabecalho);
+                    fragmento.appendChild(itens);
+                    for (const m of grupo.itens) itens.appendChild(montarItem(m, faltando));
+                }
+            } else {
+                for (const m of visiveis) fragmento.appendChild(montarItem(m, faltando));
+            }
+            lista.innerHTML = "";
+            lista.appendChild(fragmento);
+            if (resultado.temMais) {
+                const botaoMais = botaoAcao(lista, "Mostrar mais");
+                botaoMais.addEventListener("click", () => {
+                    limite += passo();
+                    atualizar(false);
+                });
+            }
+            if (faltando.length) preencherTrechosQueFaltam(db, faltando);
+        }
+        return { atualizar, status, lista };
+    }
+
+    // "Atualizar reacoes pelo servidor": pede ao Telegram as reacoes ATUAIS
+    // das mensagens ja salvas (messages.getMessagesReactions, 100 por
+    // chamada) dos ultimos N dias (preferencia) e grava no indice - total,
+    // por emoji e as SUAS reacoes. Era o que faltava pra "Minhas reacoes"
+    // pegar mensagem antiga em que voce reagiu depois do scan (o truque da
+    // "letra a" na busca ao vivo fazia isso sem querer, so pra 50 mensagens).
+    // Pausa pedida pelo Telegram aparece em contagem no status.
+    let atualizacaoDeReacoesRodando = false;
+    async function atualizarReacoesPeloServidor(db, chatIdEscolhido, dias, aoProgresso, ctxExterno) {
+        if (atualizacaoDeReacoesRodando) throw new Error("ja tem uma atualizacao de reacoes rodando");
+        atualizacaoDeReacoesRodando = true;
+        try {
+            const cli = await obterClienteParaFerramentas();
+            const desde = new Date(Date.now() - dias * 86400000).toISOString();
+            const excluidos = carregarGruposExcluidos();
+            const porChat = new Map();
+            for (const valor of db.indice.values()) {
+                if (chatIdEscolhido ? valor.chatId !== chatIdEscolhido : excluidos.has(valor.chatId)) continue;
+                if ((valor.dateUtc || "") < desde) continue;
+                if (!porChat.has(valor.chatId)) porChat.set(valor.chatId, []);
+                porChat.get(valor.chatId).push(valor.messageId);
+            }
+            let atualizadas = 0;
+            let mudaram = 0;
+            const pulados = [];
+            let indiceChat = 0;
+            for (const [chatId, ids] of porChat) {
+                indiceChat++;
+                const titulo = (buscarChat(db, chatId) || {}).chatTitle || chatId;
+                const ctx = ctxExterno || { sinal: null, aoPausa: (s) => s && aoProgresso(titulo + ": Telegram pediu pausa de " + s + "s...") };
+                let entidade;
+                try {
+                    entidade = await chamarComPausaLocal(() => encontrarEntidadePorChatId(chatId), ctx);
+                } catch (erro) {
+                    entidade = null;
+                }
+                if (!entidade) {
+                    pulados.push(titulo + " (a conta nao esta mais no grupo)");
+                    continue;
+                }
+                ids.sort((a, b) => b - a);
+                for (let i = 0; i < ids.length; i += 100) {
+                    aoProgresso("Grupo " + indiceChat + " de " + porChat.size + " (" + titulo + "): " + Math.min(i + 100, ids.length) + " de " + ids.length + " mensagens");
+                    const lote = ids.slice(i, i + 100);
+                    let resposta;
+                    try {
+                        resposta = await chamarComPausaLocal(
+                            () => cli.invoke(new Api.messages.GetMessagesReactions({ peer: entidade, id: lote }), undefined, { floodSleepThreshold: 0 }),
+                            ctx
+                        );
+                    } catch (erro) {
+                        if (erroSoDesteChat(erro)) {
+                            pulados.push(titulo + " (" + erro.errorMessage + ")");
+                            break;
+                        }
+                        throw erro;
+                    }
+                    const atualizacoes = (resposta && resposta.updates) || [];
+                    const respondidas = new Set();
+                    for (const u of atualizacoes) {
+                        if (u.className !== "UpdateMessageReactions") continue;
+                        respondidas.add(Number(u.msgId));
+                        if (aplicarReacoesNoIndice(db, chatId + ":" + u.msgId, u.reactions)) mudaram++;
+                        atualizadas++;
+                    }
+                    // Mensagem sem reacao nenhuma pode nao vir na resposta: zera.
+                    for (const id of lote) {
+                        if (respondidas.has(id)) continue;
+                        if (aplicarReacoesNoIndice(db, chatId + ":" + id, null)) mudaram++;
+                    }
+                    await descarregarEscritasPendentes(db);
+                }
+            }
+            return { atualizadas, mudaram, pulados, grupos: porChat.size };
+        } finally {
+            atualizacaoDeReacoesRodando = false;
+        }
+    }
+
+    // Grava no indice as reacoes novas de uma mensagem ja salva (mantendo
+    // visto e o resto). Devolve true se algo mudou.
+    function aplicarReacoesNoIndice(db, key, reacoes) {
+        const leve = db.indice.get(key);
+        if (!leve) return false;
+        const { reactions, total, minhasReacoes } = extrairReacoes({ reactions: reacoes });
+        const emojis = reactions.length ? reactions.map((r) => [r.emoji, r.count]) : undefined;
+        const igual =
+            (leve.reactionTotal || 0) === total &&
+            JSON.stringify(leve.minhasReacoes || []) === JSON.stringify(minhasReacoes) &&
+            JSON.stringify(leve.emojis || null) === JSON.stringify(emojis || null);
+        if (igual) return false;
+        // Sem reacao: "emojis: null" (e nao apagar o campo) - assim o null do
+        // indice vence o emoji antigo do arquivo do chat (comVistoDoIndice).
+        const novo = { ...leve, reactionTotal: total, minhasReacoes, emojis: emojis || null };
+        db.indice.set(key, novo);
+        const cacheDoChat = db.textoCompletoPorChat.get(leve.chatId);
+        const completo = cacheDoChat && cacheDoChat.get(key);
+        if (completo) cacheDoChat.set(key, { ...completo, reactionTotal: total, minhasReacoes, emojis: novo.emojis });
+        adiarAnexo(db, "indice.jsonl", JSON.stringify(novo) + "\n");
+        return true;
+    }
+
+    function botaoAtualizarReacoes(container, db, obterChatId, aoTerminar, aoStatus) {
+        const dias = lerPreferencia("atualizar_reacoes_dias");
+        const botao = botaoPequeno(container, "Atualizar reacoes pelo servidor (ultimos " + dias + " dias)", async () => {
+            botao.disabled = true;
+            try {
+                const r = await atualizarReacoesPeloServidor(db, obterChatId(), dias, aoStatus);
+                aoStatus(
+                    r.mudaram + " mensagem(ns) com reacao diferente atualizada(s), de " + r.atualizadas + " conferida(s) em " + r.grupos + " grupo(s)." +
+                        (r.pulados.length ? "\nPulados: " + r.pulados.join("; ") : "")
+                );
+                aoTerminar();
+            } catch (erro) {
+                aoStatus("Nao deu pra atualizar as reacoes: " + mensagemDoErro(erro));
+            } finally {
+                botao.disabled = false;
+            }
+        });
+        botao.title =
+            "Pergunta ao Telegram as reacoes de agora das mensagens ja salvas (total, por emoji e as suas) - pega reacao que voce fez DEPOIS do scan. 1 chamada a cada 100 mensagens. Quantos dias: Configuracoes > Listas.";
+        return botao;
     }
 
     // ---- Tela de resultados ----
@@ -171958,221 +173159,41 @@ window.TRP_VERSAO = "2026.10.13.2";
         // Grupo desmarcado em "Configurar grupos" nao aparece no seletor -
         // ver comentario em renderizarTabelaChats().
         const excluidos = carregarGruposExcluidos();
-        const chats = (await listarChats(db)).filter((c) => !excluidos.has(c.chatId));
+        const chats = listarChats(db).filter((c) => !excluidos.has(c.chatId));
         chats.sort((a, b) => (a.chatTitle || "").localeCompare(b.chatTitle || ""));
-
-        const filtros = document.createElement("div");
-        filtros.style.cssText = "display:flex;gap:8px;margin-bottom:10px;";
-        filtros.innerHTML =
-            '<select id="trp-filtro-grupo" style="flex:2;min-width:0;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:6px;">' +
-            '<option value="">Todos os grupos</option>' +
-            "</select>" +
-            '<select id="trp-filtro-ordenar" style="flex:1;min-width:0;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:6px;">' +
-            '<option value="reacoes">Mais reacoes</option>' +
-            '<option value="data">Mais recentes</option>' +
-            "</select>" +
-            '<input id="trp-filtro-minimo" type="number" min="1" value="1" style="width:56px;flex-shrink:0;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:6px;">';
-        corpo.appendChild(filtros);
-
-        const selectGrupo = filtros.querySelector("#trp-filtro-grupo");
-        for (const c of chats) {
-            const opcao = document.createElement("option");
-            opcao.value = c.chatId;
-            opcao.textContent = (c.chatTitle || c.chatId) + " (ate msg " + (c.lastScannedMessageId || 0) + ")";
-            selectGrupo.appendChild(opcao);
-        }
-        const selectOrdenar = filtros.querySelector("#trp-filtro-ordenar");
-        const inputMinimo = filtros.querySelector("#trp-filtro-minimo");
-
-        // Mesmo filtro de periodo de "Buscar mensagens" - replicado aqui
-        // porque as duas telas de pesquisa compartilham praticamente todos
-        // os recursos. Em branco nos dois lados = sem filtro de data.
-        const filtrosData = document.createElement("div");
-        filtrosData.style.cssText = "display:flex;gap:8px;margin-bottom:10px;";
-        filtrosData.innerHTML =
-            '<div style="flex:1;"><label style="display:block;color:#8b92a3;font-size:11px;margin-bottom:2px;">De (data)</label>' +
-            '<input id="trp-top-data-de" type="date" style="width:100%;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:6px;box-sizing:border-box;"></div>' +
-            '<div style="flex:1;"><label style="display:block;color:#8b92a3;font-size:11px;margin-bottom:2px;">Ate (data)</label>' +
-            '<input id="trp-top-data-ate" type="date" style="width:100%;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:6px;box-sizing:border-box;"></div>';
-        corpo.appendChild(filtrosData);
-        const inputDataDe = filtrosData.querySelector("#trp-top-data-de");
-        const inputDataAte = filtrosData.querySelector("#trp-top-data-ate");
-
-        // Oculta (so na exibicao, nao apaga nada) as mensagens ja marcadas
-        // como "visto" na caixinha individual de cada item - pra quem usa
-        // essa lista como um "pra fazer" e nao quer ficar rolando por cima
-        // do que ja viu toda vez que abre a tela de novo.
-        let ocultarVistos = false;
-        const blocoOcultarVistos = document.createElement("div");
-        blocoOcultarVistos.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:12px;";
-        const checkboxOcultarVistos = criarQuadradoMarcavel(false, (marcado) => {
-            ocultarVistos = marcado;
-            atualizarLista();
-        });
-        const labelOcultarVistos = document.createElement("span");
-        labelOcultarVistos.style.color = "#8b92a3";
-        labelOcultarVistos.textContent = "Ocultar as ja marcadas como vistas";
-        blocoOcultarVistos.appendChild(checkboxOcultarVistos.elemento);
-        blocoOcultarVistos.appendChild(labelOcultarVistos);
-        corpo.appendChild(blocoOcultarVistos);
-
-        // Indicador de carregamento SEPARADO da lista - desde que
-        // atualizarLista() parou de esvaziar "lista" durante o
-        // recarregamento (pra nao causar o salto de scroll), trocar de
-        // filtro ou clicar "Mostrar mais" ficou sem nenhum sinal visivel de
-        // que algo esta acontecendo enquanto o resultado anterior continua
-        // na tela - podia parecer que travou. Esse texto muda sozinho, nunca
-        // toca em "lista", entao nao reintroduz o problema de scroll.
-        const statusCarregando = document.createElement("div");
-        statusCarregando.style.cssText = "color:#8b92a3;font-size:11px;min-height:14px;margin-bottom:4px;";
-        corpo.appendChild(statusCarregando);
-
-        const lista = document.createElement("div");
-        corpo.appendChild(lista);
-
         if (!chats.length) {
-            lista.innerHTML = '<div style="color:#8b92a3;">Nenhum grupo escaneado ainda. Roda o scan primeiro.</div>';
+            textoAviso(corpo, "Nenhum grupo escaneado ainda. Roda o scan primeiro.");
             return;
         }
 
-        // Limite cresce com "Mostrar mais" - comeca em 50. Esse limite (fixo
-        // em 50 e sem jeito de pedir mais) era o motivo de mensagem com
-        // reacao suficiente "sumir" da lista: com "Todos os grupos"
-        // selecionado, o ranking mistura todo mundo, entao uma mensagem de
-        // um grupo pode ficar fora dos top 50 globais mesmo tendo mais
-        // reacao que mensagens exibidas de outro grupo.
-        let limiteAtual = 50;
+        const filtros = montarFiltrosDeLista(corpo, db, chats, "top", { ordenar: true, minimo: true }, () => lista.atualizar(true));
+        linhaDeQuadrado(corpo, "top_ocultar_vistos", "Ocultar as ja marcadas como vistas", null, () => lista.atualizar(true));
+        const barra = document.createElement("div");
+        barra.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;";
+        corpo.appendChild(barra);
+        botaoLimparFiltros(barra, filtros.nomes, () => telaResultados());
+        botaoSalvarBusca(barra, db, "top", "", filtros.nomes);
 
-        async function atualizarLista() {
-            // So mostra "Carregando..." quando a lista esta mesmo vazia (
-            // primeira carga). Em "Mostrar mais" ou troca de filtro ja tem
-            // conteudo antigo na tela - ele fica exibido sem mudanca ate os
-            // dados novos chegarem, e so entao o conteudo e trocado tudo de
-            // uma vez (sem await no meio). Antes disso aqui reescrevia
-            // lista.innerHTML pra "Carregando..." antes do await: o
-            // navegador tinha a chance de pintar essa lista vazia e
-            // recalcular/zerar o scroll do painel antes da funcao
-            // retomar - restaurar o scroll depois (mesmo com
-            // requestAnimationFrame) nao bastava porque o salto ja tinha
-            // acontecido. Nao esvaziar a lista enquanto busca elimina o
-            // problema na raiz, em vez de tentar compensar depois.
-            if (!lista.childNodes.length) {
-                lista.innerHTML = '<div style="color:#8b92a3;">Carregando...</div>';
-            }
-            statusCarregando.textContent = "Carregando...";
-            const chatId = selectGrupo.value || null;
-            const minimo = parseInt(inputMinimo.value, 10) || 1;
-            const dataDe = inputDataDe.value || null;
-            const dataAte = inputDataAte.value || null;
-            const ordenarPor = selectOrdenar.value;
-            const mensagens = await buscarTop(db, {
-                chatId,
-                minimo,
-                limite: limiteAtual,
-                dataDe,
-                dataAte,
-                ordenarPor,
-                excluidos,
-            });
-            statusCarregando.textContent = "";
-            if (!mensagens.length) {
-                lista.innerHTML = '<div style="color:#8b92a3;">Nenhuma mensagem encontrada com esse filtro.</div>';
-                return;
-            }
-            // Filtro de exibicao, nao de dados - "Mostrar mais" (logo
-            // abaixo) continua olhando mensagens.length (antes do filtro),
-            // pra saber se tem mais resultado la na frente mesmo que tudo
-            // que coube nesta pagina ja tenha sido visto.
-            const visiveis = ocultarVistos ? mensagens.filter((m) => !m.visto) : mensagens;
-            if (!visiveis.length) {
-                lista.innerHTML =
-                    '<div style="color:#8b92a3;">Todas as mensagens desse filtro ja foram marcadas como vistas.</div>';
-                if (mensagens.length >= limiteAtual) {
-                    const botaoMais = botaoAcao(lista, "Mostrar mais");
-                    botaoMais.addEventListener("click", async () => {
-                        limiteAtual += 50;
-                        await atualizarLista();
-                    });
-                }
-                return;
-            }
-
-            const novoConteudo = document.createDocumentFragment();
-            for (const m of visiveis) {
-                const item = document.createElement("div");
-                item.style.cssText =
-                    "padding:8px 0;border-bottom:1px solid #2a2f3a;display:flex;gap:8px;align-items:flex-start;" +
-                    (m.visto ? "opacity:0.55;" : "");
-
-                const quadrado = criarQuadradoMarcavel(m.visto, (novoValor) => {
-                    marcarVisto(db, m.key, novoValor);
-                    item.style.opacity = novoValor ? "0.55" : "1";
-                });
-                item.appendChild(quadrado.elemento);
-
-                const conteudo = document.createElement("div");
-                conteudo.style.cssText = "flex:1;min-width:0;";
-                conteudo.innerHTML =
-                    '<a href="https://web.telegram.org/k/#' + idBaseDoChatId(m.chatId) + "?post=" + m.messageId + '"' +
-                    ' target="_blank" rel="noopener" style="color:#4da3ff;font-weight:600;text-decoration:none;display:block;">' +
-                    m.reactionTotal +
-                    " reacoes - " +
-                    escapeHtml(m.dateUtc.slice(0, 10)) +
-                    "</a>" +
-                    '<div style="color:#8b92a3;font-size:11px;">' +
-                    escapeHtml(m.chatTitle) +
-                    "</div>" +
-                    "<div>" +
-                    escapeHtml(truncar(m.texto || m.textPreview || "", 160)) +
-                    "</div>";
-                item.appendChild(conteudo);
-                novoConteudo.appendChild(item);
-            }
-
-            // Troca tudo de uma vez, sem await entre o esvaziar e o
-            // repopular - o navegador nunca chega a pintar um estado vazio
-            // no meio do caminho.
-            lista.innerHTML = "";
-            lista.appendChild(novoConteudo);
-
-            if (mensagens.length >= limiteAtual) {
-                const botaoMais = botaoAcao(lista, "Mostrar mais");
-                botaoMais.addEventListener("click", async () => {
-                    limiteAtual += 50;
-                    await atualizarLista();
-                });
-            }
-        }
-
-        selectGrupo.addEventListener("change", () => {
-            limiteAtual = 50;
-            atualizarLista();
+        const lista = criarListaDeMensagens(corpo, db, {
+            passo: () => lerPreferencia("itens_por_pagina"),
+            ocultarVistos: () => lerPreferencia("top_ocultar_vistos"),
+            vazio: "Nenhuma mensagem encontrada com esse filtro.",
+            async buscar(limite) {
+                const f = filtros.filtros();
+                const mensagens = buscarTop(db, { ...f, limite, excluidos, ocultarVistos: lerPreferencia("top_ocultar_vistos") });
+                return { mensagens, temMais: mensagens.length >= limite };
+            },
+            montarItem: (m, faltando) =>
+                criarItemDeMensagem(db, m, { titulo: m.reactionTotal + " reacoes - " + m.dateUtc.slice(0, 10), tamanhoTexto: 160, faltando }),
         });
-        selectOrdenar.addEventListener("change", () => {
-            limiteAtual = 50;
-            atualizarLista();
-        });
-        inputMinimo.addEventListener("change", () => {
-            limiteAtual = 50;
-            atualizarLista();
-        });
-        inputDataDe.addEventListener("change", () => {
-            limiteAtual = 50;
-            atualizarLista();
-        });
-        inputDataAte.addEventListener("change", () => {
-            limiteAtual = 50;
-            atualizarLista();
-        });
-        await atualizarLista();
+        botaoAtualizarReacoes(barra, db, () => filtros.selectGrupo.value || null, () => lista.atualizar(false), (t) => (lista.status.textContent = t));
+        await lista.atualizar(true);
     }
 
     // ---- Tela "Minhas reacoes" - mensagem que a PROPRIA conta reagiu,
-    // usado como marcador/lembrete (ver buscarMinhasReacoes). Cópia
-    // simplificada de telaResultados(): sem "ordenar por"/"minimo" (aqui so
-    // existe "reagi ou nao reagi", nao faz sentido um limiar de reacoes),
-    // ordenado por data (mais recente primeiro) - o caso de uso e achar
-    // rapido o que foi marcado ha pouco, nao o mais "popular".
+    // usado como marcador/lembrete (ver buscarMinhasReacoes). Sem "ordenar
+    // por"/"minimo" (aqui so existe "reagi ou nao reagi"), mais recente
+    // primeiro.
     async function telaMinhasReacoes() {
         definirTituloTela("Minhas reacoes");
         const corpo = corpoDoPainel();
@@ -172180,1600 +173201,746 @@ window.TRP_VERSAO = "2026.10.13.2";
 
         const db = await abrirBanco();
         const excluidos = carregarGruposExcluidos();
-        const chats = (await listarChats(db)).filter((c) => !excluidos.has(c.chatId));
+        const chats = listarChats(db).filter((c) => !excluidos.has(c.chatId));
         chats.sort((a, b) => (a.chatTitle || "").localeCompare(b.chatTitle || ""));
+        if (!chats.length) {
+            textoAviso(corpo, "Nenhum grupo escaneado ainda. Roda o scan primeiro.");
+            return;
+        }
 
         const avisoLimitacao = document.createElement("div");
         avisoLimitacao.style.cssText = "color:#8b92a3;font-size:11px;margin-bottom:10px;";
         avisoLimitacao.textContent =
-            "So aparece aqui mensagem escaneada (ou rescaneada) depois que esse recurso foi adicionado - " +
-            "reacao em mensagem ja salva antes disso so entra na proxima vez que o chat dela for escaneado de novo.";
+            'Reacao que voce fez DEPOIS do scan so aparece depois do "Atualizar reacoes pelo servidor" (abaixo) ou de escanear o grupo de novo.';
         corpo.appendChild(avisoLimitacao);
 
-        const filtros = document.createElement("div");
-        filtros.style.cssText = "display:flex;gap:8px;margin-bottom:10px;";
-        filtros.innerHTML =
-            '<select id="trp-minhas-filtro-grupo" style="flex:1;min-width:0;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:6px;">' +
-            '<option value="">Todos os grupos</option>' +
-            "</select>";
-        corpo.appendChild(filtros);
+        const filtros = montarFiltrosDeLista(corpo, db, chats, "minhas", {}, () => lista.atualizar(true));
+        linhaDeQuadrado(corpo, "minhas_ocultar_vistos", "Ocultar as ja marcadas como vistas", null, () => lista.atualizar(true));
+        const barra = document.createElement("div");
+        barra.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;";
+        corpo.appendChild(barra);
+        botaoLimparFiltros(barra, filtros.nomes, () => telaMinhasReacoes());
+        botaoSalvarBusca(barra, db, "minhas", "", filtros.nomes);
 
-        const selectGrupo = filtros.querySelector("#trp-minhas-filtro-grupo");
-        for (const c of chats) {
-            const opcao = document.createElement("option");
-            opcao.value = c.chatId;
-            opcao.textContent = c.chatTitle || c.chatId;
-            selectGrupo.appendChild(opcao);
-        }
-
-        const filtrosData = document.createElement("div");
-        filtrosData.style.cssText = "display:flex;gap:8px;margin-bottom:10px;";
-        filtrosData.innerHTML =
-            '<div style="flex:1;"><label style="display:block;color:#8b92a3;font-size:11px;margin-bottom:2px;">De (data)</label>' +
-            '<input id="trp-minhas-data-de" type="date" style="width:100%;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:6px;box-sizing:border-box;"></div>' +
-            '<div style="flex:1;"><label style="display:block;color:#8b92a3;font-size:11px;margin-bottom:2px;">Ate (data)</label>' +
-            '<input id="trp-minhas-data-ate" type="date" style="width:100%;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:6px;box-sizing:border-box;"></div>';
-        corpo.appendChild(filtrosData);
-        const inputDataDe = filtrosData.querySelector("#trp-minhas-data-de");
-        const inputDataAte = filtrosData.querySelector("#trp-minhas-data-ate");
-
-        let ocultarVistos = false;
-        const blocoOcultarVistos = document.createElement("div");
-        blocoOcultarVistos.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:12px;";
-        const checkboxOcultarVistos = criarQuadradoMarcavel(false, (marcado) => {
-            ocultarVistos = marcado;
-            atualizarLista();
+        const lista = criarListaDeMensagens(corpo, db, {
+            passo: () => lerPreferencia("itens_por_pagina"),
+            ocultarVistos: () => lerPreferencia("minhas_ocultar_vistos"),
+            vazio: "Nenhuma mensagem encontrada com esse filtro.",
+            async buscar(limite) {
+                const f = filtros.filtros();
+                const mensagens = buscarMinhasReacoes(db, { ...f, limite, excluidos, ocultarVistos: lerPreferencia("minhas_ocultar_vistos") });
+                return { mensagens, temMais: mensagens.length >= limite };
+            },
+            montarItem: (m, faltando) =>
+                criarItemDeMensagem(db, m, {
+                    titulo:
+                        (m.minhasReacoes || []).map(rotuloDoEmoji).join(" ") +
+                        " - " +
+                        m.dateUtc.slice(0, 10) +
+                        (m.reactionTotal > 1 ? " (" + m.reactionTotal + " reacoes no total)" : ""),
+                    tamanhoTexto: 160,
+                    faltando,
+                }),
         });
-        const labelOcultarVistos = document.createElement("span");
-        labelOcultarVistos.style.color = "#8b92a3";
-        labelOcultarVistos.textContent = "Ocultar as ja marcadas como vistas";
-        blocoOcultarVistos.appendChild(checkboxOcultarVistos.elemento);
-        blocoOcultarVistos.appendChild(labelOcultarVistos);
-        corpo.appendChild(blocoOcultarVistos);
-
-        const statusCarregando = document.createElement("div");
-        statusCarregando.style.cssText = "color:#8b92a3;font-size:11px;min-height:14px;margin-bottom:4px;";
-        corpo.appendChild(statusCarregando);
-
-        const lista = document.createElement("div");
-        corpo.appendChild(lista);
-
-        if (!chats.length) {
-            lista.innerHTML = '<div style="color:#8b92a3;">Nenhum grupo escaneado ainda. Roda o scan primeiro.</div>';
-            return;
-        }
-
-        let limiteAtual = 50;
-
-        async function atualizarLista() {
-            if (!lista.childNodes.length) {
-                lista.innerHTML = '<div style="color:#8b92a3;">Carregando...</div>';
-            }
-            statusCarregando.textContent = "Carregando...";
-            const chatId = selectGrupo.value || null;
-            const dataDe = inputDataDe.value || null;
-            const dataAte = inputDataAte.value || null;
-            const mensagens = await buscarMinhasReacoes(db, { chatId, limite: limiteAtual, dataDe, dataAte, excluidos });
-            statusCarregando.textContent = "";
-            if (!mensagens.length) {
-                lista.innerHTML = '<div style="color:#8b92a3;">Nenhuma mensagem encontrada com esse filtro.</div>';
-                return;
-            }
-            const visiveis = ocultarVistos ? mensagens.filter((m) => !m.visto) : mensagens;
-            if (!visiveis.length) {
-                lista.innerHTML =
-                    '<div style="color:#8b92a3;">Todas as mensagens desse filtro ja foram marcadas como vistas.</div>';
-                if (mensagens.length >= limiteAtual) {
-                    const botaoMais = botaoAcao(lista, "Mostrar mais");
-                    botaoMais.addEventListener("click", async () => {
-                        limiteAtual += 50;
-                        await atualizarLista();
-                    });
-                }
-                return;
-            }
-
-            const novoConteudo = document.createDocumentFragment();
-            for (const m of visiveis) {
-                const item = document.createElement("div");
-                item.style.cssText =
-                    "padding:8px 0;border-bottom:1px solid #2a2f3a;display:flex;gap:8px;align-items:flex-start;" +
-                    (m.visto ? "opacity:0.55;" : "");
-
-                const quadrado = criarQuadradoMarcavel(m.visto, (novoValor) => {
-                    marcarVisto(db, m.key, novoValor);
-                    item.style.opacity = novoValor ? "0.55" : "1";
-                });
-                item.appendChild(quadrado.elemento);
-
-                const conteudo = document.createElement("div");
-                conteudo.style.cssText = "flex:1;min-width:0;";
-                conteudo.innerHTML =
-                    '<a href="https://web.telegram.org/k/#' + idBaseDoChatId(m.chatId) + "?post=" + m.messageId + '"' +
-                    ' target="_blank" rel="noopener" style="color:#4da3ff;font-weight:600;text-decoration:none;display:block;">' +
-                    escapeHtml((m.minhasReacoes || []).join(" ")) +
-                    " - " +
-                    escapeHtml(m.dateUtc.slice(0, 10)) +
-                    (m.reactionTotal > 1 ? " (" + m.reactionTotal + " reacoes no total)" : "") +
-                    "</a>" +
-                    '<div style="color:#8b92a3;font-size:11px;">' +
-                    escapeHtml(m.chatTitle) +
-                    "</div>" +
-                    "<div>" +
-                    escapeHtml(truncar(m.texto || m.textPreview || "", 160)) +
-                    "</div>";
-                item.appendChild(conteudo);
-                novoConteudo.appendChild(item);
-            }
-
-            lista.innerHTML = "";
-            lista.appendChild(novoConteudo);
-
-            if (mensagens.length >= limiteAtual) {
-                const botaoMais = botaoAcao(lista, "Mostrar mais");
-                botaoMais.addEventListener("click", async () => {
-                    limiteAtual += 50;
-                    await atualizarLista();
-                });
-            }
-        }
-
-        selectGrupo.addEventListener("change", () => {
-            limiteAtual = 50;
-            atualizarLista();
-        });
-        inputDataDe.addEventListener("change", () => {
-            limiteAtual = 50;
-            atualizarLista();
-        });
-        inputDataAte.addEventListener("change", () => {
-            limiteAtual = 50;
-            atualizarLista();
-        });
-        await atualizarLista();
+        botaoAtualizarReacoes(barra, db, () => filtros.selectGrupo.value || null, () => lista.atualizar(false), (t) => (lista.status.textContent = t));
+        await lista.atualizar(true);
     }
 
     // ---- Tela de busca por palavra-chave ----
 
-    async function telaBusca() {
+    // Busca ao vivo no servidor (messages.Search, o mesmo da busca nativa)
+    // num grupo. Grava TODA mensagem achada: a nova entra no banco (conserta
+    // buraco de scan) e a ja salva tem reacoes/autor atualizados (antes a ja
+    // salva era ignorada e a reacao feita depois do scan nunca chegava em
+    // "Minhas reacoes"). Ate "busca_servidor_limite" mensagens por busca
+    // (antes 50 fixo). Devolve o Set das keys que eram novas.
+    async function buscarAoVivoNoServidor(db, chatId, termo, aoProgresso) {
+        const entidade = await encontrarEntidadePorChatId(chatId);
+        if (!entidade) throw new Error("grupo nao encontrado entre os dialogs dessa conta agora");
+        const chatInfo = buscarChat(db, chatId);
+        const chatTitle = (chatInfo && chatInfo.chatTitle) || chatId;
+        const limite = lerPreferencia("busca_servidor_limite");
+        const novas = new Set();
+        let vistas = 0;
+        for await (const mensagem of cliente.iterMessages(entidade, { search: termo, limit: limite })) {
+            vistas++;
+            const registro = montarRegistroDoScan(db, chatId, chatTitle, mensagem);
+            if (!db.indice.has(registro.key)) novas.add(registro.key);
+            await salvarMensagem(db, registro, { adiarGravacao: true });
+            if (vistas % 50 === 0 && aoProgresso) aoProgresso("Servidor: " + vistas + " mensagens conferidas...");
+        }
+        await descarregarEscritasPendentes(db);
+        return { novas, vistas };
+    }
+
+    // Busca ao vivo no servidor e POR GRUPO (messages.search pede o chat).
+    // Antes, com a caixinha marcada e "Todos os grupos" escolhido, a parte
+    // do servidor era pulada em silencio (rodada 5, teste real do usuario).
+    // Agora: caixinha marcada bloqueia "Todos" no seletor e explica; se ja
+    // estava em "Todos", a busca nao roda ate escolher um grupo.
+    const EXPLICACAO_SERVIDOR_POR_GRUPO = "busca no servidor e por grupo; para buscar em todos, use Busca avancada > Nas suas conversas";
+    function situacaoDaBuscaNoServidor(servidorMarcado, chatId) {
+        if (!servidorMarcado) return { noServidor: false, bloquearTodos: false, impedeBusca: false, aviso: "" };
+        if (!chatId) {
+            return { noServidor: false, bloquearTodos: true, impedeBusca: true, aviso: "Escolha um grupo pra buscar no servidor (ou desmarque a caixinha). " + EXPLICACAO_SERVIDOR_POR_GRUPO[0].toUpperCase() + EXPLICACAO_SERVIDOR_POR_GRUPO.slice(1) + "." };
+        }
+        return { noServidor: true, bloquearTodos: true, impedeBusca: false, aviso: EXPLICACAO_SERVIDOR_POR_GRUPO[0].toUpperCase() + EXPLICACAO_SERVIDOR_POR_GRUPO.slice(1) + "." };
+    }
+
+    async function telaBusca(pedido) {
         definirTituloTela("Buscar mensagens");
         const corpo = corpoDoPainel();
         botaoVoltar(corpo);
 
         const db = await abrirBanco();
-        // Grupo desmarcado em "Configurar grupos" nao aparece no seletor -
-        // ver comentario em renderizarTabelaChats().
         const excluidos = carregarGruposExcluidos();
-        const chats = (await listarChats(db)).filter((c) => !excluidos.has(c.chatId));
+        const chats = listarChats(db).filter((c) => !excluidos.has(c.chatId));
         chats.sort((a, b) => (a.chatTitle || "").localeCompare(b.chatTitle || ""));
 
         const aviso = document.createElement("div");
         aviso.style.cssText = "display:flex;align-items:center;gap:4px;color:#8b92a3;margin-bottom:10px;";
         aviso.innerHTML =
-            "<span>Busca so dentro do que ja foi escaneado.</span>" +
+            "<span>Busca dentro do que ja foi escaneado (e, se marcado, ao vivo no servidor).</span>" +
             criarIconeInfoHtml(
-                'Grupo escaneado antes dessa funcao existir completa o texto do historico antigo sozinho na proxima vez que passar pelo scan (tela de scan mostra "completando historico antigo" enquanto isso roda).'
+                'Varias palavras = qualquer uma delas (OU). Campo em branco = todas as mensagens, com os filtros. Grupo escaneado antes da busca por palavra existir completa o texto antigo sozinho na proxima passada do scan.'
             );
         corpo.appendChild(aviso);
 
-        const filtros = document.createElement("div");
-        filtros.style.cssText = "display:flex;gap:8px;margin-bottom:10px;";
-        filtros.innerHTML =
-            '<select id="trp-busca-grupo" style="flex:2;min-width:0;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:6px;">' +
-            '<option value="">Todos os grupos</option>' +
-            "</select>" +
-            '<select id="trp-busca-ordenar" style="flex:1;min-width:0;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:6px;">' +
-            '<option value="data">Mais recentes</option>' +
-            '<option value="reacoes">Mais reacoes</option>' +
-            "</select>" +
-            '<input id="trp-busca-minimo" type="number" min="0" value="0" title="Minimo de reacoes" style="width:56px;flex-shrink:0;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:6px;">';
-        corpo.appendChild(filtros);
-        const selectGrupo = filtros.querySelector("#trp-busca-grupo");
-        const selectOrdenar = filtros.querySelector("#trp-busca-ordenar");
-        const inputMinimo = filtros.querySelector("#trp-busca-minimo");
-        for (const c of chats) {
-            const opcao = document.createElement("option");
-            opcao.value = c.chatId;
-            opcao.textContent = c.chatTitle || c.chatId;
-            selectGrupo.appendChild(opcao);
-        }
+        const filtros = montarFiltrosDeLista(corpo, db, chats, "busca", { ordenar: true, minimo: true }, () => {
+            atualizarDisponibilidadeServidor();
+            if (jaBuscou && !situacaoDaBuscaNoServidor(lerPreferencia("busca_servidor"), filtros.selectGrupo.value).impedeBusca) lista.atualizar(true);
+        });
 
-        // Filtro por periodo - opcional, deixa os dois em branco pra nao
-        // filtrar por data nenhuma. Compara contra dateUtc (ISO), entao
-        // funciona so com o texto "AAAA-MM-DD" que o proprio <input
-        // type="date"> devolve.
-        const filtrosData = document.createElement("div");
-        filtrosData.style.cssText = "display:flex;gap:8px;margin-bottom:10px;";
-        filtrosData.innerHTML =
-            '<div style="flex:1;"><label style="display:block;color:#8b92a3;font-size:11px;margin-bottom:2px;">De (data)</label>' +
-            '<input id="trp-busca-data-de" type="date" style="width:100%;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:6px;box-sizing:border-box;"></div>' +
-            '<div style="flex:1;"><label style="display:block;color:#8b92a3;font-size:11px;margin-bottom:2px;">Ate (data)</label>' +
-            '<input id="trp-busca-data-ate" type="date" style="width:100%;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:6px;box-sizing:border-box;"></div>';
-        corpo.appendChild(filtrosData);
-        const inputDataDe = filtrosData.querySelector("#trp-busca-data-de");
-        const inputDataAte = filtrosData.querySelector("#trp-busca-data-ate");
-
-        const campoBusca = campoTexto(corpo, "Palavra ou trecho a buscar (em branco = todas as mensagens)", "text");
+        const campoBusca = campoTexto(corpo, "Palavra ou trecho a buscar (em branco = todas as mensagens)", "text", (pedido && pedido.termo) || "");
         const historicoBusca = ligarHistoricoBusca(campoBusca, CHAVE_HISTORICO_BUSCA_LOCAL);
 
-        // Busca hibrida: alem do nosso banco local (substring, OU logico
-        // entre as palavras), tambem pergunta ao vivo pro SERVIDOR do
-        // Telegram (o mesmo messages.Search que a busca nativa usa, via
-        // cliente.iterMessages com a opcao "search"). Os dois sistemas sao
-        // independentes (ver HISTORICO_TECNICO.md, secao sobre a pesquisa
-        // nessa diferenca) - um pega o que o outro perde, por razoes
-        // diferentes. Mensagem que o servidor acha e a gente ainda nao
-        // tinha salva localmente e salva na hora (conserta o buraco de
-        // scan sozinho, de brinde). So funciona com um grupo especifico
-        // selecionado - "Todos os grupos" faria uma chamada por grupo
-        // escaneado, arriscando flood wait sem necessidade.
-        const blocoServidor = document.createElement("div");
-        blocoServidor.style.cssText = "display:flex;align-items:flex-start;gap:8px;margin:6px 0 10px;font-size:12px;";
-        const checkboxServidor = criarQuadradoMarcavel(false, null);
-        const labelServidor = document.createElement("span");
-        labelServidor.style.color = "#8b92a3";
-        labelServidor.textContent = "Tambem buscar ao vivo no servidor do Telegram";
-        blocoServidor.appendChild(checkboxServidor.elemento);
-        blocoServidor.appendChild(labelServidor);
-        blocoServidor.insertAdjacentHTML(
-            "beforeend",
-            criarIconeInfoHtml(
-                'Pega mensagem que o scan local ainda nao tem. Precisa de um grupo especifico selecionado - nao funciona com "Todos os grupos" (faria uma chamada por grupo escaneado, arriscando bloqueio temporario por excesso de pedidos).'
-            )
+        linhaDeQuadrado(
+            corpo,
+            "busca_servidor",
+            "Tambem buscar ao vivo no servidor do Telegram",
+            'Pega mensagem que o scan ainda nao tem e atualiza as reacoes das que ja estao salvas. So num grupo escolhido: com a caixinha marcada, "Todos os grupos" fica bloqueado. Quantas mensagens trazer: Configuracoes > Listas.',
+            () => atualizarDisponibilidadeServidor()
         );
-        corpo.appendChild(blocoServidor);
+        const avisoServidor = document.createElement("div");
+        avisoServidor.className = "trp-aviso-servidor";
+        avisoServidor.style.cssText = "font-size:11px;margin:-6px 0 10px 26px;";
+        corpo.appendChild(avisoServidor);
+        linhaDeQuadrado(corpo, "busca_so_link", "So mensagens com link", null, () => jaBuscou && lista.atualizar(true));
+        linhaDeQuadrado(corpo, "busca_ocultar_vistos", "Ocultar as ja marcadas como vistas", null, () => jaBuscou && lista.atualizar(true));
 
-        // Oculta (so na exibicao) as mensagens ja marcadas como vista -
-        // mesmo recurso de "Ver top reacoes", ver comentario la.
-        let ocultarVistos = false;
-        const blocoOcultarVistos = document.createElement("div");
-        blocoOcultarVistos.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:12px;";
-        const checkboxOcultarVistos = criarQuadradoMarcavel(false, (marcado) => {
-            ocultarVistos = marcado;
-            if (jaBuscou) executarBusca();
-        });
-        const labelOcultarVistos = document.createElement("span");
-        labelOcultarVistos.style.color = "#8b92a3";
-        labelOcultarVistos.textContent = "Ocultar as ja marcadas como vistas";
-        blocoOcultarVistos.appendChild(checkboxOcultarVistos.elemento);
-        blocoOcultarVistos.appendChild(labelOcultarVistos);
-        corpo.appendChild(blocoOcultarVistos);
-
-        // So funciona com um grupo especifico - com "Todos os grupos" a
-        // caixa fica visivelmente desabilitada (nao so um aviso em texto que
-        // da pra nao notar) e e desmarcada sozinha, pra nunca ficar marcada
-        // enganando o usuario que ela esta fazendo busca ao vivo em tudo
-        // quando na pratica nao faz nada nesse estado.
+        // Caixinha marcada: "Todos os grupos" bloqueado + linha explicando;
+        // em "Todos", pede pra escolher um grupo (em vermelho).
         function atualizarDisponibilidadeServidor() {
-            const disponivel = !!selectGrupo.value;
-            checkboxServidor.elemento.style.opacity = disponivel ? "1" : "0.35";
-            checkboxServidor.elemento.style.pointerEvents = disponivel ? "" : "none";
-            labelServidor.style.opacity = disponivel ? "1" : "0.55";
-            if (!disponivel && checkboxServidor.checked) {
-                checkboxServidor.checked = false;
+            const situacao = situacaoDaBuscaNoServidor(lerPreferencia("busca_servidor"), filtros.selectGrupo.value);
+            const opcaoTodos = filtros.selectGrupo.options[0];
+            if (opcaoTodos) {
+                opcaoTodos.disabled = situacao.bloquearTodos;
+                opcaoTodos.textContent = situacao.bloquearTodos ? "Todos os grupos (bloqueado: busca no servidor)" : "Todos os grupos";
             }
+            avisoServidor.textContent = situacao.aviso;
+            avisoServidor.style.color = situacao.impedeBusca ? "#ff6b6b" : "#8b92a3";
+            avisoServidor.style.display = situacao.aviso ? "" : "none";
+            return situacao;
         }
         atualizarDisponibilidadeServidor();
 
+        const barra = document.createElement("div");
+        barra.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;";
+        corpo.appendChild(barra);
+        botaoLimparFiltros(barra, filtros.nomes.concat(["busca_so_link"]), () => telaBusca({ termo: campoBusca.value }));
+        botaoSalvarBusca(barra, db, "busca", () => campoBusca.value.trim(), filtros.nomes.concat(["busca_so_link", "busca_servidor"]));
+
         const botaoBuscar = botaoAcao(corpo, "Buscar");
-
-        // Ver comentario igual em telaResultados() - indicador separado da
-        // lista, pra trocar de termo/filtro continuar com algum sinal visual
-        // de "carregando" mesmo que o resultado anterior fique exibido sem
-        // mudanca ate o novo chegar (de propostio, pra nao repetir o salto de
-        // scroll que existia antes).
-        const statusCarregando = document.createElement("div");
-        statusCarregando.style.cssText = "color:#8b92a3;font-size:11px;min-height:14px;margin-bottom:4px;";
-        corpo.appendChild(statusCarregando);
-
-        const lista = document.createElement("div");
-        lista.innerHTML =
-            '<div style="color:#8b92a3;">Digita algo pra buscar, ou deixa em branco e aperta "Buscar" pra trazer todas as mensagens (sujeito aos filtros de grupo/data/minimo).</div>';
-        corpo.appendChild(lista);
-
-        // Cresce com "Mostrar mais" - comeca em 100. buscarTexto() ja
-        // devolve o conjunto inteiro de resultados ordenado (por reacoes ou
-        // data) antes de cortar pro limite atual, entao "Mostrar mais" so
-        // revela mais itens mais abaixo nessa lista ja ordenada - nao existe
-        // mais risco de um grupo sozinho "engolir" o limite e esconder os
-        // demais (ver nota em cima de buscarTexto()).
-        let limiteAtual = 100;
-        // Vira true na primeira vez que o usuario aperta "Buscar"/Enter -
-        // so a partir dai os filtros (grupo/ordenar/minimo/data/ocultar
-        // vistos) re-executam a busca sozinhos ao mudar. Antes disso, mudar
-        // um filtro nao faz nada (a tela ainda nao tem nenhum resultado pra
-        // atualizar). Campo em branco agora E uma busca valida (ver nota
-        // em executarBusca()), entao nao da mais pra usar
-        // "campoBusca.value.trim()" como sinal de "ja buscou alguma vez".
         let jaBuscou = false;
 
-        function criarItemResultado(m) {
-            const texto = m.texto || m.textPreview || "";
-            const item = document.createElement("div");
-            item.style.cssText =
-                "padding:8px 0;border-bottom:1px solid #2a2f3a;display:flex;gap:8px;align-items:flex-start;" +
-                (m.visto ? "opacity:0.55;" : "");
-
-            const quadrado = criarQuadradoMarcavel(m.visto, (novoValor) => {
-                marcarVisto(db, m.key, novoValor);
-                item.style.opacity = novoValor ? "0.55" : "1";
-            });
-            item.appendChild(quadrado.elemento);
-
-            const conteudo = document.createElement("div");
-            conteudo.style.cssText = "flex:1;min-width:0;";
-            conteudo.innerHTML =
-                '<a href="https://web.telegram.org/k/#' + idBaseDoChatId(m.chatId) + "?post=" + m.messageId + '"' +
-                ' target="_blank" rel="noopener" style="color:#4da3ff;font-weight:600;text-decoration:none;display:block;">' +
-                escapeHtml(m.dateUtc.slice(0, 10)) +
-                (m.reactionTotal ? " - " + m.reactionTotal + " reacoes" : "") +
-                "</a>" +
-                '<div style="color:#8b92a3;font-size:11px;">' +
-                escapeHtml(m.chatTitle) +
-                (m.achadoNoServidor
-                    ? ' <span style="color:#5ec26a;">· achado ao vivo no servidor, salvo agora</span>'
-                    : "") +
-                "</div>" +
-                "<div>" +
-                escapeHtml(truncar(texto, 200)) +
-                "</div>";
-            item.appendChild(conteudo);
-            return item;
-        }
-
-        // Cabecalho clicavel de grupo (maximizar/minimizar) usado quando a
-        // busca e em "Todos" e o resultado tem mais de um grupo.
-        function criarCabecalhoGrupo(chatTitle, quantidade) {
-            const cabecalho = document.createElement("div");
-            cabecalho.style.cssText =
-                "display:flex;align-items:center;gap:6px;padding:6px 0;cursor:pointer;user-select:none;" +
-                "color:#8b92a3;font-weight:600;font-size:12px;border-top:1px solid #2a2f3a;margin-top:4px;";
-            const seta = document.createElement("span");
-            seta.textContent = "▾";
-            const texto = document.createElement("span");
-            texto.textContent = chatTitle + " (" + quantidade + ")";
-            cabecalho.appendChild(seta);
-            cabecalho.appendChild(texto);
-            return { cabecalho, seta };
-        }
-
-        // Busca ao vivo no servidor (messages.Search, o mesmo mecanismo da
-        // busca nativa) pra UM grupo especifico - novas mensagens achadas
-        // que nao estavam salvas localmente sao salvas na hora (conserta o
-        // buraco sozinho). Separado de buscarTexto() porque e uma fonte de
-        // dados completamente diferente (servidor, ao vivo) em vez de ler o
-        // IndexedDB local.
-        async function buscarAoVivoNoServidor(chatId, termo, minimoReacoes) {
-            const entidade = await encontrarEntidadePorChatId(chatId);
-            if (!entidade) {
-                throw new Error("grupo nao encontrado entre os dialogs dessa conta agora");
-            }
-            const chatInfo = chats.find((c) => c.chatId === chatId);
-            const chatTitle = (chatInfo && chatInfo.chatTitle) || chatId;
-            const resultados = [];
-            for await (const mensagem of cliente.iterMessages(entidade, { search: termo, limit: 50 })) {
-                const { reactions, total, minhasReacoes } = extrairReacoes(mensagem);
-                if (total < minimoReacoes) continue;
-                resultados.push({
-                    key: chatId + ":" + mensagem.id,
-                    chatId,
-                    messageId: mensagem.id,
-                    dateUtc: dataIso(mensagem),
-                    texto: textoCompleto(mensagem),
-                    reactionTotal: total,
-                    reactions,
-                    minhasReacoes,
-                    chatTitle,
-                });
-            }
-            return resultados;
-        }
-
-        async function executarBusca() {
-            const termo = campoBusca.value.trim();
-            jaBuscou = true;
-            // Campo em branco agora e uma busca valida (de proposito -
-            // pedido do usuario pra poder "mostrar tudo" sem precisar
-            // digitar uma letra quase universal) - buscarTexto() trata
-            // termo vazio como "bate com qualquer mensagem" (ver comentario
-            // la). So nao registra no historico de autocomplete um termo
-            // em branco, isso nao ajudaria ninguem.
-            if (termo) historicoBusca.registrar(termo);
-            // So mostra "Buscando..." na propria lista quando ela ja esta
-            // vazia (primeira busca desse termo). Em "Mostrar mais" ou troca
-            // de termo/filtro a lista ja tem resultado anterior na tela -
-            // fica do jeito que esta, sem piscar pra vazio, ate os dados
-            // novos chegarem prontos pra trocar tudo de uma vez (ver
-            // comentario mais abaixo, perto do "Mostrar mais"). Isso faz o
-            // "esta buscando" sumir visualmente nesses casos - statusCarregando
-            // (elemento separado, nunca esvaziado por engano) cobre esse
-            // aviso em todo clique de busca, inclusive quando a busca ao
-            // vivo no servidor (mais lenta, round-trip de rede de verdade)
-            // deixa a tela "parada" por um tempo sem nenhum sinal.
-            if (!lista.childNodes.length) {
-                lista.innerHTML = '<div style="color:#8b92a3;">Buscando...</div>';
-            }
-            statusCarregando.textContent = "Buscando...";
-            try {
-                await executarBuscaPorDentro();
-            } finally {
-                statusCarregando.textContent = "";
-            }
-        }
-
-        async function executarBuscaPorDentro() {
-            const termo = campoBusca.value.trim();
-            const chatId = selectGrupo.value || null;
-            const minimo = parseInt(inputMinimo.value, 10) || 0;
-            const ordenarPor = selectOrdenar.value;
-            const dataDe = inputDataDe.value || null;
-            const dataAte = inputDataAte.value || null;
-            const mensagens = await buscarTexto(db, {
-                termo,
-                chatId,
-                minimo,
-                limite: limiteAtual,
-                ordenarPor,
-                dataDe,
-                dataAte,
-                excluidos,
-            });
-
-            let novasDoServidor = [];
-            let erroServidor = null;
-            if (checkboxServidor.checked && chatId) {
-                try {
-                    const chavesLocais = new Set(mensagens.map((m) => m.key));
-                    const doServidor = await buscarAoVivoNoServidor(chatId, termo, minimo);
-                    // Salva TODA mensagem que o servidor achou e a gente ainda
-                    // nao tinha - o filtro de data abaixo e so pra exibicao
-                    // nesta busca, nao deve impedir de consertar um buraco de
-                    // scan que esteja fora do periodo escolhido agora.
-                    const novasNoServidor = doServidor.filter((m) => !chavesLocais.has(m.key));
-                    for (const m of novasNoServidor) {
-                        await salvarMensagem(db, m);
+        const lista = criarListaDeMensagens(corpo, db, {
+            passo: () => lerPreferencia("itens_por_pagina") * 2,
+            ocultarVistos: () => lerPreferencia("busca_ocultar_vistos"),
+            vazio: "Nada encontrado com esse termo.",
+            agruparPorGrupo: () => !filtros.selectGrupo.value,
+            async buscar(limite, aoProgresso) {
+                const termo = campoBusca.value.trim();
+                const f = filtros.filtros();
+                const avisos = [];
+                let novas = new Set();
+                if (situacaoDaBuscaNoServidor(lerPreferencia("busca_servidor"), f.chatId).noServidor) {
+                    try {
+                        aoProgresso("Buscando ao vivo no servidor...");
+                        const r = await buscarAoVivoNoServidor(db, f.chatId, termo, aoProgresso);
+                        novas = r.novas;
+                        avisos.push({
+                            texto: "Servidor: " + r.vistas + " mensagem(ns) conferida(s), " + novas.size + " nova(s) salva(s) agora; as ja salvas tiveram as reacoes atualizadas.",
+                            cor: "#5ec26a",
+                        });
+                    } catch (erro) {
+                        avisos.push({ texto: "Busca ao vivo no servidor falhou (" + mensagemDoErro(erro) + ") - resultado abaixo e so o local.", cor: "#ff6b6b" });
                     }
-                    novasDoServidor = novasNoServidor
-                        .filter((m) => {
-                            const dataDaMensagem = (m.dateUtc || "").slice(0, 10);
-                            return (!dataDe || dataDaMensagem >= dataDe) && (!dataAte || dataDaMensagem <= dataAte);
-                        })
-                        .map((m) => ({ ...m, achadoNoServidor: true }));
-                } catch (erro) {
-                    erroServidor = erro && erro.message ? erro.message : String(erro);
+                    aoProgresso("Buscando no que esta salvo...");
                 }
-            }
-
-            const todasAsMensagens = mensagens.concat(novasDoServidor);
-            if (ordenarPor === "reacoes") {
-                todasAsMensagens.sort((a, b) => (b.reactionTotal || 0) - (a.reactionTotal || 0));
-            } else {
-                todasAsMensagens.sort((a, b) => (a.dateUtc < b.dateUtc ? 1 : -1));
-            }
-
-            if (!todasAsMensagens.length) {
-                lista.innerHTML = erroServidor
-                    ? '<div style="color:#ff6b6b;">Nada encontrado local, e a busca ao vivo no servidor falhou: ' +
-                      escapeHtml(erroServidor) +
-                      "</div>"
-                    : '<div style="color:#8b92a3;">Nada encontrado com esse termo.</div>';
-                return;
-            }
-            // Filtro de exibicao (ocultarVistos), nao de dados - "Mostrar
-            // mais" continua olhando mensagens.length (antes desse
-            // filtro), ver mesmo comentario em telaResultados().
-            const visiveis = ocultarVistos ? todasAsMensagens.filter((m) => !m.visto) : todasAsMensagens;
-            if (!visiveis.length) {
-                lista.innerHTML =
-                    '<div style="color:#8b92a3;">Todas as mensagens encontradas ja foram marcadas como vistas.</div>';
-                if (mensagens.length >= limiteAtual) {
-                    const botaoMais = botaoAcao(lista, "Mostrar mais");
-                    botaoMais.addEventListener("click", async () => {
-                        limiteAtual += 100;
-                        await executarBusca();
-                    });
-                }
-                return;
-            }
-            // Monta tudo num fragmento fora da tela primeiro, e so troca o
-            // conteudo real da lista no final, de uma vez (sem await no
-            // meio). Antes disso aqui fazia lista.innerHTML = "" e ia
-            // enchendo lista aos poucos - no "Mostrar mais" isso fazia a
-            // lista ficar vazia (encolhendo o painel) bem no instante em
-            // que o navegador podia pintar/recalcular o scroll, travando-o
-            // em 0 antes do conteudo novo terminar de entrar. Com o
-            // fragmento, a lista antiga fica exibida sem mudanca ate o
-            // ultimo instante - nunca existe um estado vazio pro navegador
-            // pintar, entao o scroll nunca precisa ser restaurado.
-            const novoConteudo = document.createDocumentFragment();
-
-            if (erroServidor) {
-                const aviso = document.createElement("div");
-                aviso.style.cssText = "color:#ff6b6b;font-size:11px;margin-bottom:6px;";
-                aviso.textContent =
-                    "Busca ao vivo no servidor falhou (" + erroServidor + ") - resultado abaixo e so o local.";
-                novoConteudo.appendChild(aviso);
-            }
-            if (novasDoServidor.length) {
-                const aviso = document.createElement("div");
-                aviso.style.cssText = "color:#5ec26a;font-size:11px;margin-bottom:6px;";
-                aviso.textContent =
-                    novasDoServidor.length +
-                    " mensagem(ns) achada(s) ao vivo no servidor que nao estavam salvas local - ja salvei agora.";
-                novoConteudo.appendChild(aviso);
-            }
-
-            const maisDeUmGrupo = !chatId && visiveis.some((m) => m.chatId !== visiveis[0].chatId);
-            if (maisDeUmGrupo) {
-                for (const grupo of agruparPorChat(visiveis)) {
-                    const { cabecalho, seta } = criarCabecalhoGrupo(grupo.chatTitle, grupo.itens.length);
-                    const containerItens = document.createElement("div");
-                    cabecalho.addEventListener("click", () => {
-                        const estaAberto = containerItens.style.display !== "none";
-                        containerItens.style.display = estaAberto ? "none" : "block";
-                        seta.textContent = estaAberto ? "▸" : "▾";
-                    });
-                    novoConteudo.appendChild(cabecalho);
-                    novoConteudo.appendChild(containerItens);
-                    for (const m of grupo.itens) containerItens.appendChild(criarItemResultado(m));
-                }
-            } else {
-                for (const m of visiveis) novoConteudo.appendChild(criarItemResultado(m));
-            }
-
-            lista.innerHTML = "";
-            lista.appendChild(novoConteudo);
-
-            if (mensagens.length >= limiteAtual) {
-                const botaoMais = botaoAcao(lista, "Mostrar mais");
-                botaoMais.addEventListener("click", async () => {
-                    limiteAtual += 100;
-                    await executarBusca();
+                const mensagens = await buscarTexto(db, {
+                    termo,
+                    ...f,
+                    limite,
+                    excluidos,
+                    ocultarVistos: lerPreferencia("busca_ocultar_vistos"),
+                    soLink: lerPreferencia("busca_so_link"),
                 });
-            }
-        }
+                for (const m of mensagens) if (novas.has(m.key)) m.achadoNoServidor = true;
+                return { mensagens, temMais: mensagens.length >= limite, avisos };
+            },
+            montarItem: (m) =>
+                criarItemDeMensagem(db, m, {
+                    titulo: m.dateUtc.slice(0, 10) + (m.reactionTotal ? " - " + m.reactionTotal + " reacoes" : ""),
+                    texto: m.texto || m.textPreview || "",
+                    tamanhoTexto: 200,
+                }),
+        });
+        lista.lista.innerHTML =
+            '<div style="color:#8b92a3;">Digita algo pra buscar, ou deixa em branco e aperta "Buscar" pra trazer todas as mensagens (sujeito aos filtros).</div>';
 
-        botaoBuscar.addEventListener("click", () => {
-            limiteAtual = 100;
-            executarBusca();
-        });
-        campoBusca.addEventListener("keydown", (ev) => {
-            if (ev.key === "Enter") {
-                limiteAtual = 100;
-                executarBusca();
+        const executar = () => {
+            // Nunca pula o servidor em silencio: sem grupo, nao busca e diz.
+            if (atualizarDisponibilidadeServidor().impedeBusca) {
+                lista.lista.innerHTML = "";
+                textoAviso(lista.lista, "Escolha um grupo no seletor antes de buscar (a busca no servidor e por grupo), ou desmarque \"Tambem buscar ao vivo no servidor\".", "#ff6b6b");
+                return;
             }
+            jaBuscou = true;
+            const termo = campoBusca.value.trim();
+            if (termo) historicoBusca.registrar(termo);
+            lista.atualizar(true);
+        };
+        botaoBuscar.addEventListener("click", executar);
+        campoBusca.addEventListener("keydown", (ev) => {
+            if (ev.key === "Enter") executar();
         });
-        selectGrupo.addEventListener("change", () => {
-            atualizarDisponibilidadeServidor();
-            limiteAtual = 100;
-            if (jaBuscou) executarBusca();
-        });
-        selectOrdenar.addEventListener("change", () => {
-            limiteAtual = 100;
-            if (jaBuscou) executarBusca();
-        });
-        inputMinimo.addEventListener("change", () => {
-            limiteAtual = 100;
-            if (jaBuscou) executarBusca();
-        });
-        inputDataDe.addEventListener("change", () => {
-            limiteAtual = 100;
-            if (jaBuscou) executarBusca();
-        });
-        inputDataAte.addEventListener("change", () => {
-            limiteAtual = 100;
-            if (jaBuscou) executarBusca();
-        });
+        if (pedido && pedido.executar) executar();
     }
 
-    // ---- Tela de busca avancada: pesquisa global do Telegram (canais/grupos publicos que a conta nao participa) ----
+    // ---- Tela de busca avancada (refeita na rodada 4) ----
+    //
+    // Antes eram 3 campos soltos (nome, post por hashtag/texto, colar link)
+    // e o texto livre dava erro de Premium sem explicar. Agora:
+    //   1. Link do Telegram: "https://t.me/" fixo na tela, digita so o final
+    //      (ou cola qualquer forma de link, @usuario, varios de uma vez). Diz
+    //      o que e, se o convite vale e - em link de mensagem - compara com o
+    //      que esta salvo (era a tela "Verificar mensagem").
+    //   2. Palavra-chave: UMA busca que junta tudo - grupos/canais/pessoas
+    //      pelo nome (contacts.search), posts publicos (channels.searchPosts:
+    //      hashtag sempre; texto livre so quando o Telegram deixa de graca
+    //      nesta conta, com o motivo na tela), links t.me achados nos posts
+    //      (conferidos) e as suas proprias conversas (messages.searchGlobal -
+    //      inclusive grupo fora do scan).
+    // As opcoes (o que buscar, filtros, ordem) ficam guardadas (preferencias
+    // "ba_...", Configuracoes > Busca avancada).
 
-    // Usa channels.SearchPosts, metodo oficial do Telegram pra busca global de
-    // conteudo em canais/supergrupos publicos (inclusive os que a conta nao
-    // participa) - so alcanca grupo/canal publico (com @usuario), nunca grupo
-    // fechado. Dois modos, mutuamente exclusivos (a API exige exatamente um):
-    // hashtag (sem custo documentado) ou texto livre (cada conta tem uma cota
-    // diaria gratis, documentada via channels.CheckSearchPostsFlood; depois
-    // da cota, cada busca cobra em Telegram Stars). Independente do scan local
-    // - e so mais uma chamada na mesma conexao, da pra abrir essa tela com o
-    // scan rodando em segundo plano sem nenhum problema.
-    async function telaBuscaAvancada() {
+    // Roda "tarefa" pra cada item, no maximo "simultaneas" de cada vez.
+    async function emParaleloLimitado(itens, simultaneas, tarefa) {
+        let proximo = 0;
+        const trabalhadores = [];
+        for (let i = 0; i < Math.min(simultaneas, itens.length); i++) {
+            trabalhadores.push(
+                (async () => {
+                    while (proximo < itens.length) await tarefa(itens[proximo++]);
+                })()
+            );
+        }
+        await Promise.all(trabalhadores);
+    }
+
+    // Numero de membros que o Telegram nao mandou (objeto "min"): pede o
+    // canal completo, uma vez por canal nesta tela.
+    function criarBuscadorDeMembros() {
+        const cache = new Map();
+        return async (chat) => {
+            if (!chat || chat.participantsCount != null || chat.className !== "Channel") return;
+            const chave = String(chat.id);
+            if (!cache.has(chave)) {
+                cache.set(
+                    chave,
+                    cliente
+                        .invoke(new Api.channels.GetFullChannel({ channel: chat }))
+                        .then((completo) => (completo.fullChat && typeof completo.fullChat.participantsCount === "number" ? completo.fullChat.participantsCount : null))
+                        .catch(() => null)
+                );
+            }
+            const total = await cache.get(chave);
+            if (total != null) chat.participantsCount = total;
+        };
+    }
+
+    function tipoDoChat(chat) {
+        return chat && chat.broadcast ? "canal" : "grupo";
+    }
+
+    function secaoDeResultado(corpo, titulo) {
+        const bloco = document.createElement("div");
+        bloco.style.cssText = "margin-top:14px;";
+        const cabecalho = document.createElement("div");
+        cabecalho.style.cssText = "color:#8b92a3;font-weight:600;margin-bottom:4px;";
+        cabecalho.textContent = titulo;
+        const status = document.createElement("div");
+        status.style.cssText = "color:#8b92a3;font-size:11px;margin-bottom:4px;white-space:pre-line;";
+        const lista = document.createElement("div");
+        bloco.appendChild(cabecalho);
+        bloco.appendChild(status);
+        bloco.appendChild(lista);
+        corpo.appendChild(bloco);
+        return { bloco, cabecalho, status, lista, titulo };
+    }
+
+    function linhaSimples(lista, html, extra) {
+        const linha = document.createElement("div");
+        linha.style.cssText = "padding:6px 0;border-bottom:1px solid #2a2f3a;font-size:12px;";
+        linha.innerHTML = html;
+        if (extra) linha.appendChild(extra);
+        lista.appendChild(linha);
+        return linha;
+    }
+
+    // messages.searchGlobal (rodada 5, conferido com core.telegram.org/
+    // method/messages.searchGlobal e /api/offsets): 1a pagina com
+    // offset_rate 0, offset_peer vazio e offset_id 0; as seguintes com
+    // offset_rate = next_rate da resposta (messages.messagesSlice) e
+    // offset_peer/offset_id = chat e id da ULTIMA mensagem recebida.
+    // Filtro so grupos / so canais / so conversas privadas: groups_only,
+    // broadcasts_only, users_only (um de cada vez).
+    function parametrosDaBuscaGlobal(termo, tipo, cursor) {
+        const parametros = { q: termo, filter: new Api.InputMessagesFilterEmpty({}), minDate: 0, maxDate: 0, limit: 50, ...cursor };
+        if (tipo === "grupos") parametros.groupsOnly = true;
+        else if (tipo === "canais") parametros.broadcastsOnly = true;
+        else if (tipo === "privados") parametros.usersOnly = true;
+        return parametros;
+    }
+
+    // Proximo cursor, ou null se acabou. messages.messages = veio tudo;
+    // messagesSlice traz "count" (total no servidor): acabou quando ja
+    // recebeu isso ou a pagina veio vazia. Sem next_rate (nao deveria
+    // acontecer num slice), usa a data da ultima mensagem.
+    function proximaPaginaDaBuscaGlobal(resposta, recebidasAteAgora, peerDaUltima) {
+        const todas = resposta.messages || [];
+        const ultima = todas[todas.length - 1];
+        if (!ultima || resposta.className === "messages.Messages") return null;
+        if (typeof resposta.count === "number") {
+            if (recebidasAteAgora >= resposta.count) return null;
+        } else if (todas.length < 50) return null;
+        return {
+            offsetRate: resposta.nextRate || ultima.date,
+            offsetPeer: peerDaUltima(ultima) || new Api.InputPeerEmpty({}),
+            offsetId: ultima.id,
+        };
+    }
+
+    async function telaBuscaAvancada(pedido) {
         definirTituloTela("Busca avancada");
         const corpo = corpoDoPainel();
         botaoVoltar(corpo);
+        const db = await abrirBanco();
 
-        const aviso = document.createElement("div");
-        aviso.style.cssText = "display:flex;align-items:center;gap:4px;color:#8b92a3;margin-bottom:10px;";
-        aviso.innerHTML =
-            '<span>Busca GLOBAL em canais/grupos com (ou que ja tiveram) @usuario publico, mesmo sem a conta participar.</span>' +
+        // ---------- 1. link ----------
+        const tituloLink = document.createElement("div");
+        tituloLink.style.cssText = "color:#8b92a3;font-weight:600;margin-bottom:6px;display:flex;align-items:center;gap:4px;";
+        tituloLink.innerHTML =
+            "<span>Conferir link do Telegram</span>" +
             criarIconeInfoHtml(
-                '"Publico" aqui e so isso, nao tem nada a ver com o grupo exigir aprovacao pra alguem entrar: um grupo pode pedir aprovacao de novo membro e mesmo assim aparecer aqui, porque ler/buscar nao exige ser membro, so mandar mensagem exige. Grupo sem @usuario nenhum (so com link de convite) nunca aparece aqui - precisaria ter entrado nele pra alcancar o conteudo (ver tela de "Buscar mensagens"). Segundo o proprio blog do Telegram (ago/2025), esse recurso "e inicialmente disponivel so pra contas Premium" - a documentacao oficial do metodo (core.telegram.org/method/channels.searchPosts) descreve a cota diaria gratis e o pagamento em Stars como algo que vale so pra "full text post searches (query)", sem mencionar nada parecido pra busca por hashtag; bate com o que foi testado aqui (busca por HASHTAG funcionou sem Premium, por TEXTO LIVRE deu erro de conta Premium exigida).'
+                'Digite so o final do link (ex.: "nomedocanal", "nomedocanal/123", "+convite", "c/123456/789") ou cole o link inteiro, @usuario, tg://..., ou varios de uma vez. Diz se e canal, grupo ou pessoa, titulo, membros, se o convite ainda vale e, em link de mensagem, se ela existe e se esta salva no painel (com as reacoes de la e daqui). NAO entra em nada.'
             );
-        corpo.appendChild(aviso);
+        corpo.appendChild(tituloLink);
+        const linhaLink = document.createElement("div");
+        linhaLink.style.cssText = "display:flex;align-items:stretch;margin-bottom:6px;";
+        const prefixo = document.createElement("span");
+        prefixo.textContent = "https://t.me/";
+        prefixo.style.cssText = "background:#2a2f3a;color:#8b92a3;border:1px solid #2a2f3a;border-radius:6px 0 0 6px;padding:8px;font-size:12px;white-space:nowrap;";
+        const campoLink = document.createElement("input");
+        campoLink.type = "text";
+        campoLink.placeholder = "nomedocanal/123";
+        campoLink.style.cssText = ESTILO_CAMPO + "flex:1;min-width:0;border-radius:0 6px 6px 0;padding:8px;";
+        linhaLink.appendChild(prefixo);
+        linhaLink.appendChild(campoLink);
+        corpo.appendChild(linhaLink);
+        const botaoLink = botaoAcao(corpo, "Conferir link");
+        const resultadoLink = document.createElement("div");
+        resultadoLink.style.cssText = "margin-top:6px;";
+        corpo.appendChild(resultadoLink);
 
-        // Busca por NOME (contacts.search) - diferente da busca por
-        // hashtag/texto livre logo abaixo, que procura DENTRO do conteudo
-        // das mensagens (channels.SearchPosts). Pedido do usuario depois de
-        // testar a busca por post com termo generico e so achar grupo em
-        // outro idioma/assunto: ele queria achar O GRUPO (ex.: "tem grupo do
-        // Palmeiras?"), nao um post que por acaso menciona a palavra. Isso
-        // e exatamente pra isso - mesma ideia de diretorio de grupo que
-        // sites externos (tipo agregador de link de convite por categoria)
-        // oferecem, so que direto na API oficial do Telegram, sem precisar
-        // de site nenhum. contacts.search e publico, sem cota/Premium/Stars
-        // documentado (so erro de validacao se o texto vier vazio/curto
-        // demais) - NAO entra em nada, so lista.
-        const tituloPorNome = document.createElement("div");
-        tituloPorNome.style.cssText =
-            "color:#8b92a3;margin-bottom:6px;font-weight:600;display:flex;align-items:center;gap:4px;";
-        tituloPorNome.innerHTML =
-            "<span>Buscar grupo/canal/usuario por NOME</span>" +
-            criarIconeInfoHtml(
-                'Diferente da busca por hashtag/texto livre (mais abaixo), que procura DENTRO do conteudo das mensagens - por isso um termo generico acha post de qualquer assunto, ate em outro idioma. Essa aqui procura pelo NOME/username do proprio grupo/canal/usuario, igual a lupa de busca do Telegram - sem cota, sem Premium, sem Stars.'
-            );
-        corpo.appendChild(tituloPorNome);
+        // Colou o link inteiro: o campo fica so com o final (o prefixo ja
+        // esta na tela). Varios links: deixa como colou.
+        const normalizarCampo = () => {
+            const links = normalizarLinksDigitados(campoLink.value);
+            if (links.length === 1) campoLink.value = links[0];
+            return links;
+        };
+        campoLink.addEventListener("paste", () => setTimeout(normalizarCampo, 0));
+        campoLink.addEventListener("change", normalizarCampo);
 
-        const campoBuscaPorNome = campoTexto(corpo, 'Nome ou @username (ex.: "Palmeiras")', "text");
+        async function conferirUmLink(sufixo) {
+            const caixa = document.createElement("div");
+            caixa.style.cssText = "border:1px solid #2a2f3a;border-radius:6px;padding:8px;margin-bottom:8px;font-size:12px;white-space:pre-line;";
+            const endereco = "https://t.me/" + sufixo;
+            caixa.textContent = endereco + " - conferindo...";
+            resultadoLink.appendChild(caixa);
+            const link = analisarLinkTelegram(endereco);
+            if (!link) {
+                caixa.textContent = endereco + "\nNao reconheci esse link (o que vem depois de t.me/ precisa ser um @usuario, +convite, joinchat/..., c/<id>/<msg> ou usuario/<msg>).";
+                caixa.style.color = "#e0a93a";
+                return;
+            }
+            const ctx = { sinal: null, maximoSegundosDePausa: 120, aoPausa: (s) => s && (caixa.textContent = endereco + "\nTelegram pediu pausa de " + s + "s...") };
+            try {
+                const r = await examinarLinkTelegram(link, ctx);
+                caixa.textContent = endereco + "\n" + r.texto;
+                caixa.appendChild(document.createElement("br"));
+                const acoes = document.createElement("div");
+                acoes.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-top:4px;";
+                caixa.appendChild(acoes);
+                if (link.tipo !== "privado") acoes.appendChild(criarLinkExterno("abrir no Telegram", endereco, ESTILO_BOTAO_PEQUENO));
+                if (r.entidade && r.entidade.className === "User" && !r.entidade.bot) {
+                    const id = String(r.entidade.id);
+                    const botao = botaoPequeno(acoes, estaMonitorado(id) ? "Ja monitorado" : "Monitorar esta pessoa", async () => {
+                        atualizarRemetente(db, id, r.entidade);
+                        await descarregarEscritasPendentes(db);
+                        botao.textContent = (await adicionarMonitorado(db, { id, tipo: "pessoa" })) ? "Monitorando (veja em Monitorados)" : "Ja monitorado";
+                        botao.disabled = true;
+                    });
+                    if (estaMonitorado(id)) botao.disabled = true;
+                }
+                if (r.messageId && r.chatId) await compararComOSalvo(caixa, acoes, r);
+            } catch (erro) {
+                caixa.textContent = endereco + "\nNao deu pra conferir: " + mensagemDoErro(erro);
+                caixa.style.color = "#ff6b6b";
+            }
+        }
 
-        // So faz sentido ordenar grupo/canal por numero de membros - usuario
-        // nao tem esse conceito, entao esse seletor so afeta a parte de
-        // grupo/canal da lista (a de usuario sempre fica na ordem que a API
-        // devolveu). Mesma ideia (e mesmo texto de opcao "Mais membros") do
-        // seletor equivalente na busca por conteudo, mais abaixo - pedido do
-        // usuario de replicar as mesmas opcoes em toda tela de busca, nao
-        // deixar um recurso so numa aba.
-        const blocoOrdenarPorNome = document.createElement("div");
-        blocoOrdenarPorNome.style.cssText = "margin-bottom:10px;";
-        const labelOrdenarPorNome = document.createElement("label");
-        labelOrdenarPorNome.textContent = "Ordenar grupo/canal por: ";
-        labelOrdenarPorNome.style.cssText = "color:#8b92a3;font-size:12px;";
-        const selectOrdenarPorNome = document.createElement("select");
-        selectOrdenarPorNome.style.cssText =
-            "background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:4px;font-size:12px;";
-        // Ao contrario da busca por conteudo (que e cronologica, por isso
-        // "Mais recentes" la), a ordem que contacts.search devolve nao e
-        // documentada pela API (provavelmente relevancia) - rotulo honesto
-        // em vez de chamar de "recente" algo que nao foi confirmado que e.
-        selectOrdenarPorNome.innerHTML =
-            '<option value="relevancia">Como o Telegram devolveu</option><option value="membros">Mais membros</option>';
-        labelOrdenarPorNome.appendChild(selectOrdenarPorNome);
-        blocoOrdenarPorNome.appendChild(labelOrdenarPorNome);
-        corpo.appendChild(blocoOrdenarPorNome);
-
-        const botaoBuscarPorNome = botaoAcao(corpo, "Buscar por nome");
-        const listaPorNome = document.createElement("div");
-        listaPorNome.style.marginBottom = "16px";
-        corpo.appendChild(listaPorNome);
-
-        // Acrescenta o link "abrir @usuario" (mesmo padrao usado em
-        // criarItemResultadoGlobal e criarItemDeLink) numa linha de
-        // resultado - so quando o chat/usuario tem @usuario publico, unico
-        // jeito de abrir https://t.me/<usuario> sem entrar nele. Sem
-        // @usuario (ex.: grupo fechado que o contacts.search achou por
-        // bater com o titulo salvo de algum contato) mostra um aviso em vez
-        // de ficar sem nada, pra ficar claro que a falta do link e
-        // esperada, nao um bug.
-        function acrescentarAbrirOuAviso(linha, usuario) {
-            if (usuario) {
-                const abrir = document.createElement("div");
-                abrir.style.cssText = "color:#4da3ff;font-size:11px;cursor:pointer;margin-top:4px;";
-                abrir.textContent = "abrir " + usuario;
-                abrir.addEventListener("click", () => {
-                    window.open("https://t.me/" + usuario.slice(1), "_blank");
+        // O antigo "Verificar mensagem": a mensagem do link esta salva? O
+        // texto ou as reacoes mudaram? Oferece salvar/atualizar na hora.
+        async function compararComOSalvo(caixa, acoes, r) {
+            const key = r.chatId + ":" + r.messageId;
+            const local = await buscarMensagem(db, key).catch(() => null);
+            const localComIndice = local ? comVistoDoIndice(db, local) : null;
+            const linhas = [];
+            if (!localComIndice) linhas.push("No painel: NAO esta salva" + (buscarChat(db, r.chatId) ? " (o grupo esta no scan - buraco do scan ou mensagem nova)" : " (grupo fora do scan)") + ".");
+            else linhas.push("No painel: salva, " + (localComIndice.reactionTotal || 0) + " reacoes" + (textoDasReacoes(localComIndice) ? " (" + textoDasReacoes(localComIndice) + ")" : "") + ".");
+            if (r.mensagem) {
+                const aoVivo = extrairReacoes(r.mensagem);
+                linhas.push("No Telegram agora: " + aoVivo.total + " reacoes" + (aoVivo.minhasReacoes.length ? ", voce reagiu com " + aoVivo.minhasReacoes.join(" ") : "") + ".");
+                if (localComIndice && normalizarTexto(localComIndice.texto || "") !== normalizarTexto(textoCompleto(r.mensagem))) linhas.push("O texto salvo e diferente do atual (editada depois do scan).");
+            }
+            const nota = document.createElement("div");
+            nota.style.cssText = "color:#8b92a3;margin-top:4px;";
+            nota.textContent = linhas.join("\n");
+            caixa.appendChild(nota);
+            if (r.mensagem && buscarChat(db, r.chatId)) {
+                const botao = botaoPequeno(acoes, localComIndice ? "Atualizar o salvo com o de agora" : "Salvar no painel agora", async () => {
+                    const titulo = (buscarChat(db, r.chatId) || {}).chatTitle || r.chatId;
+                    await salvarMensagem(db, montarRegistroDoScan(db, r.chatId, titulo, r.mensagem));
+                    botao.textContent = "Salvo";
+                    botao.disabled = true;
                 });
-                linha.appendChild(abrir);
-            } else {
-                const aviso = document.createElement("div");
-                aviso.style.cssText = "color:#8b92a3;font-size:11px;margin-top:4px;";
-                aviso.textContent = "sem @usuario publico - nao da pra abrir direto";
-                linha.appendChild(aviso);
             }
         }
 
-        // Canal/grupo referenciado dentro de uma mensagem encontrada por
-        // busca por conteudo (channels.SearchPosts) ou que bateu por nome
-        // (contacts.search) pode vir em versao reduzida da API, sem
-        // participantsCount preenchido - o Telegram chama isso de objeto
-        // "min" (ver core.telegram.org/api/min), e acontece sobretudo
-        // quando o canal e so uma referencia dentro de outra coisa, nao o
-        // alvo direto do pedido. Era exatamente isso que fazia "Ordenar
-        // por: Mais membros" nao reordenar nada de verdade (reportado pelo
-        // usuario): os participantsCount vinham ausentes pra maioria dos
-        // resultados, entao tudo empatava e a ordem de chegada ficava.
-        // channels.GetFullChannel sempre tem participantsCount preenchido
-        // (quando o canal nao esconde esse numero de proposito) - busca sob
-        // demanda, so quando o usuario realmente escolhe ordenar por
-        // membros (nunca automatico, pra nao gastar uma chamada de API por
-        // canal a toa), e guarda o resultado por chatId pra nunca pedir o
-        // mesmo canal duas vezes nesta tela - vale tanto pra busca por
-        // conteudo quanto pra busca por nome, ja que as duas usam esta
-        // mesma funcao.
-        const participantsCountResolvido = new Map();
-        async function garantirParticipantsCount(chat) {
-            if (!chat || chat.participantsCount != null) return;
-            const chave = String(chat.id);
-            if (participantsCountResolvido.has(chave)) {
-                const valorCache = participantsCountResolvido.get(chave);
-                if (valorCache != null) chat.participantsCount = valorCache;
+        const conferirLinks = async () => {
+            const links = normalizarCampo();
+            resultadoLink.innerHTML = "";
+            if (!links.length) {
+                textoAviso(resultadoLink, "Digite o final do link (ou cole o link).", "#ff6b6b");
                 return;
             }
+            botaoLink.disabled = true;
             try {
-                const completo = await cliente.invoke(new Api.channels.GetFullChannel({ channel: chat }));
-                const total =
-                    completo.fullChat && typeof completo.fullChat.participantsCount === "number"
-                        ? completo.fullChat.participantsCount
-                        : null;
-                participantsCountResolvido.set(chave, total);
-                if (total != null) chat.participantsCount = total;
-            } catch (erro) {
-                // Canal sem permissao de ver isso (ou qualquer outro erro) -
-                // so marca como "sem numero mesmo" (nao tenta de novo) e
-                // segue; fica por ultimo na ordenacao por membros, nunca
-                // quebra a tela.
-                participantsCountResolvido.set(chave, null);
-            }
-        }
-
-        // Guarda o ultimo resultado (antes de qualquer ordenacao) pra poder
-        // reordenar na hora, sem precisar buscar de novo - mesma ideia de
-        // resultadosAcumulados/renderizarListaGlobal (busca por conteudo),
-        // so que aqui e um resultado so, sem "carregar mais".
-        let ultimosGruposPorNome = [];
-        let ultimosUsuariosPorNome = [];
-
-        function renderizarListaPorNome() {
-            listaPorNome.innerHTML = "";
-            if (!ultimosGruposPorNome.length && !ultimosUsuariosPorNome.length) {
-                listaPorNome.innerHTML = '<div style="color:#8b92a3;font-size:12px;">Nada encontrado com esse nome.</div>';
-                return;
-            }
-            const grupos = [...ultimosGruposPorNome];
-            if (selectOrdenarPorNome.value === "membros") {
-                grupos.sort((a, b) => (b.participantsCount ?? -1) - (a.participantsCount ?? -1));
-            }
-            for (const chat of grupos) {
-                const linha = document.createElement("div");
-                linha.style.cssText = "padding:6px 0;border-bottom:1px solid #2a2f3a;font-size:12px;";
-                const membros =
-                    typeof chat.participantsCount === "number" ? chat.participantsCount + " membros" : null;
-                const usuario = chat.username ? "@" + chat.username : null;
-                // Canal (broadcast:true) x grupo/supergrupo (sem broadcast)
-                // - mesma distincao que criarItemResultadoGlobal ja faz
-                // pros resultados de busca por conteudo, pra nao
-                // descrever um canal como "grupo" (ou vice-versa) so
-                // nessa lista aqui.
-                const tipo = chat.broadcast ? "canal" : "grupo";
-                linha.innerHTML =
-                    '<span style="color:#4da3ff;">[' + tipo + "]</span> " +
-                    escapeHtml(chat.title || String(chat.id)) +
-                    (usuario ? " (" + escapeHtml(usuario) + ")" : "") +
-                    (membros ? ' <span style="color:#8b92a3;">- ' + membros + "</span>" : "");
-                acrescentarAbrirOuAviso(linha, usuario);
-                listaPorNome.appendChild(linha);
-            }
-            for (const usr of ultimosUsuariosPorNome) {
-                const linha = document.createElement("div");
-                linha.style.cssText = "padding:6px 0;border-bottom:1px solid #2a2f3a;font-size:12px;";
-                const nome = [usr.firstName, usr.lastName].filter(Boolean).join(" ") || "(sem nome)";
-                const usuario = usr.username ? "@" + usr.username : null;
-                linha.innerHTML =
-                    '<span style="color:#8b92a3;">[usuario]</span> ' +
-                    escapeHtml(nome) +
-                    (usuario ? " (" + escapeHtml(usuario) + ")" : "");
-                acrescentarAbrirOuAviso(linha, usuario);
-                listaPorNome.appendChild(linha);
-            }
-        }
-
-        async function ordenarPorNomeERenderizar() {
-            if (selectOrdenarPorNome.value === "membros") {
-                selectOrdenarPorNome.disabled = true;
-                listaPorNome.innerHTML = '<div style="color:#8b92a3;font-size:12px;">Carregando numero de membros...</div>';
-                try {
-                    for (const chat of ultimosGruposPorNome) await garantirParticipantsCount(chat);
-                } finally {
-                    selectOrdenarPorNome.disabled = false;
-                }
-            }
-            renderizarListaPorNome();
-        }
-
-        async function buscarPorNome() {
-            const termo = campoBuscaPorNome.value.trim();
-            if (!termo) {
-                listaPorNome.innerHTML = '<div style="color:#ff6b6b;font-size:12px;">Digita um nome pra buscar.</div>';
-                return;
-            }
-            listaPorNome.innerHTML = '<div style="color:#8b92a3;font-size:12px;">Buscando...</div>';
-            botaoBuscarPorNome.disabled = true;
-            try {
-                const resultado = await cliente.invoke(new Api.contacts.Search({ q: termo, limit: 20 }));
-                ultimosGruposPorNome = resultado.chats || [];
-                ultimosUsuariosPorNome = resultado.users || [];
-                await ordenarPorNomeERenderizar();
-            } catch (erro) {
-                listaPorNome.innerHTML =
-                    '<div style="color:#ff6b6b;font-size:12px;">Erro: ' +
-                    escapeHtml(erro && erro.message ? erro.message : String(erro)) +
-                    "</div>";
+                for (const sufixo of links.slice(0, 20)) await conferirUmLink(sufixo);
+                if (links.length > 20) textoAviso(resultadoLink, "Conferi os 20 primeiros (de " + links.length + ").");
             } finally {
-                botaoBuscarPorNome.disabled = false;
+                botaoLink.disabled = false;
             }
-        }
-        botaoBuscarPorNome.addEventListener("click", buscarPorNome);
-        campoBuscaPorNome.addEventListener("keydown", (ev) => {
-            if (ev.key === "Enter") buscarPorNome();
-        });
-        selectOrdenarPorNome.addEventListener("change", () => {
-            if (ultimosGruposPorNome.length || ultimosUsuariosPorNome.length) ordenarPorNomeERenderizar();
+        };
+        botaoLink.addEventListener("click", conferirLinks);
+        campoLink.addEventListener("keydown", (ev) => {
+            if (ev.key === "Enter") conferirLinks();
         });
 
-        const tituloConteudo = document.createElement("div");
-        tituloConteudo.style.cssText = "color:#8b92a3;margin-bottom:6px;font-weight:600;";
-        tituloConteudo.textContent = "Buscar por conteudo de post (hashtag ou texto livre)";
-        corpo.appendChild(tituloConteudo);
-
-        const statusCota = document.createElement("div");
-        statusCota.style.cssText = "color:#8b92a3;margin-bottom:10px;font-size:11px;";
-        statusCota.textContent = "Verificando cota de busca por texto livre...";
-        corpo.appendChild(statusCota);
-
-        // Guarda a ultima cota conhecida (ver executarBuscaGlobal) pra
-        // decidir, se a busca em texto livre falhar por cota esgotada, se
-        // vale oferecer o botao de pagar em Stars - sem precisar checar nem
-        // mostrar Stars antes de realmente precisar.
-        let ultimaCota = null;
-
-        cliente
-            .invoke(new Api.channels.CheckSearchPostsFlood({}))
-            .then((cota) => {
-                ultimaCota = cota;
-                if (cota.queryIsFree) {
-                    statusCota.textContent = "Busca por texto livre: sem custo agora.";
-                    return;
-                }
-                statusCota.textContent =
-                    `Busca por texto livre: ${cota.remains ?? "?"} de ${cota.totalDaily ?? "?"} gratis restantes hoje` +
-                    (cota.remains > 0 ? "." : ` - a proxima custa ${cota.starsAmount ?? "?"} Stars.`);
-            })
-            .catch((erro) => {
-                statusCota.textContent =
-                    "Nao consegui checar a cota de texto livre: " + (erro && erro.message ? erro.message : erro);
-            });
-
-        const blocoModo = document.createElement("div");
-        blocoModo.style.cssText = "display:flex;align-items:flex-start;gap:8px;margin-bottom:10px;font-size:12px;";
-        const checkboxHashtag = criarQuadradoMarcavel(false, null);
-        const labelModo = document.createElement("span");
-        labelModo.textContent = "Buscar por hashtag (sem #) em vez de texto livre";
-        blocoModo.appendChild(checkboxHashtag.elemento);
-        blocoModo.appendChild(labelModo);
-        blocoModo.insertAdjacentHTML(
-            "beforeend",
+        // ---------- 2. palavra-chave ----------
+        const tituloBusca = document.createElement("div");
+        tituloBusca.style.cssText = "color:#8b92a3;font-weight:600;margin:18px 0 6px;display:flex;align-items:center;gap:4px;";
+        tituloBusca.innerHTML =
+            "<span>Buscar por palavra-chave (tudo de uma vez)</span>" +
             criarIconeInfoHtml(
-                'So no modo hashtag: da pra buscar VARIAS hashtags de uma vez, separadas por ";" (ex.: "promocao;oferta;desconto") - cada uma vira uma chamada separada pro servidor, os resultados saem juntos numa lista so, sem duplicata. So funciona assim no modo hashtag porque ele nao tem o limite de cota/Premium do texto livre (ver aviso no topo da tela) - no modo texto livre, ";" e tratado como parte literal do termo, nao separa nada (cada busca extra consumiria mais da cota diaria/Stars).'
-            )
-        );
-        corpo.appendChild(blocoModo);
-
-        // Extrai link t.me (de @usuario ou de convite) do TEXTO das mensagens
-        // encontradas e confere se cada um ainda e valido - serve pra quem
-        // esta procurando grupo/canal relacionado a um assunto (a palavra-
-        // chave) sem precisar clicar em cada link achado so pra descobrir se
-        // ainda existe. Mais lento (uma chamada de API por link novo), por
-        // isso opcional.
-        const blocoLinks = document.createElement("div");
-        blocoLinks.style.cssText = "display:flex;align-items:flex-start;gap:8px;margin-bottom:10px;font-size:12px;";
-        const checkboxLinks = criarQuadradoMarcavel(false, null);
-        const labelLinks = document.createElement("span");
-        labelLinks.textContent = "Tambem extrair e verificar link de grupo/canal nos resultados";
-        blocoLinks.appendChild(checkboxLinks.elemento);
-        blocoLinks.appendChild(labelLinks);
-        blocoLinks.insertAdjacentHTML(
-            "beforeend",
-            criarIconeInfoHtml(
-                "Extrai link t.me/... mencionado no texto de cada mensagem encontrada e confere se ainda e valido - mais lento, uma checagem de API por link novo."
-            )
-        );
-        corpo.appendChild(blocoLinks);
-
-        // Pedido do usuario: depois de buscar por um assunto (ex. "palmeiras"),
-        // poder ver so os posts que JA citam um link de grupo/canal, em vez de
-        // vasculhar post por post pra achar os poucos que tem link. So
-        // some da lista principal (nao muda quantos posts o Telegram devolve
-        // nem a paginacao) - combinado com o checkbox de cima (extrair e
-        // verificar), fica igual a ideia de um botao so de "procurar links
-        // recentes sobre esse termo".
-        const blocoSoComLink = document.createElement("div");
-        blocoSoComLink.style.cssText = "display:flex;align-items:flex-start;gap:8px;margin-bottom:10px;font-size:12px;";
-        const checkboxSoComLink = criarQuadradoMarcavel(false, null);
-        const labelSoComLink = document.createElement("span");
-        labelSoComLink.textContent = "Mostrar so posts que citam algum link (esconde o resto)";
-        blocoSoComLink.appendChild(checkboxSoComLink.elemento);
-        blocoSoComLink.appendChild(labelSoComLink);
-        blocoSoComLink.insertAdjacentHTML(
-            "beforeend",
-            criarIconeInfoHtml(
-                'Filtra a lista de posts pra mostrar so os que mencionam t.me/... ou tg://join?invite=... no texto - util pra achar "grupo sobre esse assunto" direto, sem ler post que nao tem link nenhum. Marca o checkbox de cima junto pra esses links ja saírem conferidos.'
-            )
-        );
-        corpo.appendChild(blocoSoComLink);
-
-        const campoBusca = campoTexto(
-            corpo,
-            'Palavra-chave (texto livre) ou hashtag (varias: "a;b;c")',
-            "text"
-        );
+                'Uma busca so junta: grupos, canais e pessoas pelo NOME; posts de canais publicos (por hashtag sempre; por texto livre so quando o Telegram libera de graca pra esta conta - senao a tela explica e oferece pagar em Stars, nunca sozinho); os links t.me citados nesses posts (conferidos); e as mensagens das SUAS conversas no servidor (inclusive grupo que nao esta no scan). Varias hashtags: separe por ";". O que entra e os filtros ficam guardados (Configuracoes > Busca avancada).'
+            );
+        corpo.appendChild(tituloBusca);
+        const campoBusca = campoTexto(corpo, 'Palavra, nome ou hashtag (varias hashtags: "a;b;c")', "text", (pedido && pedido.termo) || "");
         const historicoBuscaGlobal = ligarHistoricoBusca(campoBusca, CHAVE_HISTORICO_BUSCA_GLOBAL);
 
-        // Ordena o que ja foi recebido (todas as paginas ja carregadas ate
-        // agora via "Carregar mais"), sem precisar refazer a busca - pedido
-        // do usuario, pra achar primeiro o canal/grupo maior sobre o
-        // assunto, nao so o post mais recente.
-        const blocoOrdenar = document.createElement("div");
-        blocoOrdenar.style.cssText = "margin-bottom:10px;";
-        const labelOrdenar = document.createElement("label");
-        labelOrdenar.textContent = "Ordenar por: ";
-        labelOrdenar.style.cssText = "color:#8b92a3;font-size:12px;";
-        const selectOrdenarGlobal = document.createElement("select");
-        selectOrdenarGlobal.style.cssText =
-            "background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:4px;font-size:12px;";
-        selectOrdenarGlobal.innerHTML =
-            '<option value="data">Mais recentes</option><option value="membros">Mais membros</option>';
-        labelOrdenar.appendChild(selectOrdenarGlobal);
-        blocoOrdenar.appendChild(labelOrdenar);
-        corpo.appendChild(blocoOrdenar);
+        const opcoes = document.createElement("details");
+        opcoes.style.cssText = "margin-bottom:8px;font-size:12px;color:#8b92a3;";
+        const resumoOpcoes = document.createElement("summary");
+        resumoOpcoes.textContent = "Opcoes e filtros (ficam guardados)";
+        opcoes.appendChild(resumoOpcoes);
+        corpo.appendChild(opcoes);
+        controlesDaSecao(opcoes, "busca_avancada");
 
-        const botaoBuscar = botaoAcao(corpo, "Buscar globalmente");
+        const barra = document.createElement("div");
+        barra.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;";
+        corpo.appendChild(barra);
+        botaoSalvarBusca(barra, db, "avancada", () => campoBusca.value.trim(), preferenciasDaSecao("busca_avancada").map((p) => p.nome));
+        const botaoBuscar = botaoAcao(corpo, "Buscar");
+        const resultados = document.createElement("div");
+        corpo.appendChild(resultados);
 
-        const lista = document.createElement("div");
-        corpo.appendChild(lista);
-
-        const tituloLinks = document.createElement("div");
-        tituloLinks.style.cssText = "color:#8b92a3;margin:14px 0 6px;font-weight:600;display:none;";
-        tituloLinks.textContent = "Links de grupo/canal encontrados nos resultados:";
-        corpo.appendChild(tituloLinks);
-
-        const listaLinks = document.createElement("div");
-        corpo.appendChild(listaLinks);
-
-        // valor (hash ou username, em minusculo) -> elemento <div> ja criado
-        // pra esse link - impede verificar ou listar o mesmo link duas vezes
-        // quando ele aparece em mais de uma mensagem ou reaparece numa pagina
-        // seguinte ("Carregar mais").
-        const linksVistos = new Map();
-
-        // Caixa separada pra conferir link achado FORA do Telegram (sites
-        // que agregam convite publico de grupo por categoria, por ex.) sem
-        // precisar rodar uma busca primeiro - cola o texto com o(s) link(s)
-        // (t.me/..., t.me/+hash ou tg://join?invite=hash, um por linha ou
-        // misturado em qualquer texto) e cada um e checado com a mesma
-        // verificarLinkTelegram de cima: NAO entra no grupo, so confere se o
-        // convite ainda e valido e traz titulo/qtd de participantes quando
-        // disponivel.
-        const tituloColar = document.createElement("div");
-        tituloColar.style.cssText = "color:#8b92a3;margin:16px 0 6px;font-weight:600;display:flex;align-items:center;gap:4px;";
-        tituloColar.innerHTML =
-            "<span>Conferir link de fora do Telegram</span>" +
-            criarIconeInfoHtml(
-                "Cola aqui o link de grupo/canal que voce achou em outro lugar (site de diretorio de grupos, por ex.) - aceita t.me/usuario, t.me/+hash e tg://join?invite=hash, um por linha ou misturado em qualquer texto. So confere se o convite ainda e valido e mostra titulo/qtd de participantes - NAO entra no grupo."
-            );
-        corpo.appendChild(tituloColar);
-
-        const campoColar = document.createElement("textarea");
-        campoColar.placeholder = "Cola aqui um ou mais links (t.me/..., tg://join?invite=...)";
-        campoColar.style.cssText =
-            "width:100%;min-height:60px;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;" +
-            "border-radius:6px;padding:8px;box-sizing:border-box;font-family:inherit;font-size:12px;resize:vertical;";
-        corpo.appendChild(campoColar);
-
-        const botaoConferirColados = botaoAcao(corpo, "Conferir link(s) colado(s)");
-        const avisoNenhumLink = document.createElement("div");
-        avisoNenhumLink.style.cssText = "color:#8b92a3;font-size:12px;margin-top:6px;display:none;";
-        avisoNenhumLink.textContent = "Nenhum link reconhecido nesse texto.";
-        corpo.appendChild(avisoNenhumLink);
-        const listaLinksColados = document.createElement("div");
-        listaLinksColados.style.marginTop = "6px";
-        corpo.appendChild(listaLinksColados);
-        const linksColadosVistos = new Map();
-
-        botaoConferirColados.addEventListener("click", () => {
-            const encontrados = extrairLinksTelegram(campoColar.value);
-            avisoNenhumLink.style.display = encontrados.length ? "none" : "block";
-            for (const link of encontrados) criarItemDeLink(link, listaLinksColados, linksColadosVistos);
-        });
-
-        // Pagina do jeito que a doc da API manda: offsetRate = nextRate da
-        // pagina anterior (ou a data da ultima mensagem, se nextRate nao
-        // vier); offsetPeer/offsetId = peer+id da ultima mensagem recebida.
-        // Segundo a doc da API, pedido de pagina seguinte (continuar=true)
-        // nao conta na cota diaria gratis de busca por texto livre - so o
-        // primeiro pedido de cada busca nova consome cota.
-        //
-        // Varios termos (modo hashtag, separados por ";"): cada termo tem o
-        // SEU PROPRIO cursor de paginacao independente, guardado aqui -
-        // termo -> {offsetRate, offsetPeer, offsetId} (ainda tem pagina) ou
-        // null (esgotado, "Carregar mais" para de tentar esse termo). No
-        // modo com um termo so (a imensa maioria dos casos, inclusive todo
-        // texto livre), o Map tem uma entrada so e o comportamento e
-        // identico ao de antes dessa mudanca.
-        let paginasPorTermo = new Map();
-        // chatId:messageId ja renderizado nesta busca - evita mostrar a
-        // mesma mensagem duas vezes se ela bater com mais de uma hashtag.
-        const chavesVistasGlobal = new Set();
-        // Guarda TODAS as mensagens ja recebidas (de todas as paginas/termos
-        // ja carregados nesta busca) - pedido do usuario: poder reordenar
-        // por numero de membros do grupo/canal, sem precisar refazer a
-        // chamada de API. "Carregar mais" so acrescenta aqui, a ordenacao e
-        // sempre refeita em cima de tudo que ja foi recebido ate agora.
-        let resultadosAcumulados = [];
-        let houveInexact = false;
-
-        function criarItemResultadoGlobal(m, chat, termoQueBateu) {
-            const titulo = (chat && chat.title) || "Canal/grupo desconhecido";
-            const username = chat && chat.username ? "@" + chat.username : null;
-            const tipo = chat && chat.megagroup ? "grupo" : "canal";
-            // A propria mensagem que o Telegram devolve aqui ja traz o campo
-            // nativo "reactions" (o mesmo que o scan le em extrairReacoes()),
-            // estruturado - nao e preciso "adivinhar" numero de reacao lendo
-            // o TEXTO da mensagem (ideia que foi cogitada, mas desnecessaria:
-            // o dado certo ja vem pronto, sem risco de confundir com um
-            // numero qualquer digitado no texto, tipo um preco).
-            const { total: totalReacoes } = extrairReacoes(m);
-            // participantsCount NEM SEMPRE vem de graca aqui: channels.
-            // SearchPosts devolve, junto com as mensagens, a lista "chats"
-            // com o canal/grupo referenciado (chatsPorId guarda isso), mas
-            // esse chat e so uma REFERENCIA de quem mandou a mensagem
-            // encontrada - nao o alvo direto do pedido - entao a API pode
-            // devolver ele na forma reduzida ("min", ver
-            // core.telegram.org/api/min), sem participantsCount. So mostra
-            // aqui quando ja vier preenchido de graca; "Ordenar por: Mais
-            // membros" (mais abaixo) e quem busca o numero que falta sob
-            // demanda via garantirParticipantsCount(), so quando o usuario
-            // realmente pede essa ordenacao.
-            const membros = chat && chat.participantsCount != null ? chat.participantsCount : null;
-
-            const item = document.createElement("div");
-            item.style.cssText = "padding:8px 0;border-bottom:1px solid #2a2f3a;";
-            item.innerHTML =
-                '<div style="color:#4da3ff;font-weight:600;">' +
-                escapeHtml(titulo) +
-                " (" +
-                tipo +
-                ")</div>" +
-                (username ? '<div style="color:#8b92a3;font-size:11px;">' + escapeHtml(username) + "</div>" : "") +
-                (membros != null
-                    ? '<div style="color:#8b92a3;font-size:11px;">' + membros + " membros</div>"
-                    : "") +
-                (totalReacoes
-                    ? '<div style="color:#8b92a3;font-size:11px;">' + totalReacoes + " reacoes</div>"
-                    : "") +
-                // So aparece quando a busca tem mais de uma hashtag ao mesmo
-                // tempo (separadas por ";") - com uma so, ja esta implicito
-                // qual termo bateu, nao precisa poluir cada item repetindo.
-                (termoQueBateu
-                    ? '<div style="color:#5ec26a;font-size:11px;">#' + escapeHtml(termoQueBateu) + "</div>"
-                    : "") +
-                "<div>" +
-                escapeHtml(truncar((m.message || "").trim(), 200)) +
-                "</div>";
-            if (username) {
-                const abrir = document.createElement("div");
-                abrir.style.cssText = "color:#4da3ff;font-size:11px;cursor:pointer;margin-top:4px;";
-                abrir.textContent = "abrir " + username;
-                abrir.addEventListener("click", () => {
-                    window.open("https://t.me/" + chat.username, "_blank");
-                });
-                item.appendChild(abrir);
-            }
-            return item;
-        }
-
-        // So no modo hashtag o ";" separa varios termos - cada um vira uma
-        // chamada de API independente (ver comentario no icone "i" ao lado
-        // do checkbox). No modo texto livre o ";" fica como parte literal
-        // do termo unico, de proposito (nao multiplica o gasto de
-        // cota/Stars). Dedup por versao normalizada (minusculo), mas a
-        // chamada em si usa o texto original digitado (sem o "#" na
-        // frente). Limite de 10 termos por busca - seguranca contra
-        // flood/abuso, nao documentado em lugar nenhum como necessario, so
-        // bom senso.
-        function termosDaBusca(termoBruto) {
-            if (!checkboxHashtag.checked) return [termoBruto];
-            const vistos = new Set();
-            const termos = [];
-            for (const parte of termoBruto.split(";")) {
-                const limpo = parte.trim().replace(/^#/, "");
-                if (!limpo) continue;
-                const chave = limpo.toLowerCase();
-                if (vistos.has(chave)) continue;
-                vistos.add(chave);
-                termos.push(limpo);
-                if (termos.length >= 10) break;
-            }
-            return termos;
-        }
-
-        // Redesenha "lista" inteira a partir de resultadosAcumulados (nunca
-        // refaz chamada de API) - usada tanto no fim de cada busca/pagina
-        // quanto quando o usuario so troca o "Ordenar por" sem buscar de
-        // novo. Reaplicar a ordenacao em cima de TUDO que ja foi recebido
-        // (nao so a pagina mais nova) e o que deixa "mais membros" util
-        // mesmo depois de varios "Carregar mais".
-        function renderizarListaGlobal() {
-            lista.innerHTML = "";
-            if (houveInexact) {
-                lista.insertAdjacentHTML(
-                    "beforeend",
-                    '<div style="color:#8b92a3;font-size:11px;margin-bottom:6px;">Resultado aproximado (o Telegram marcou essa busca como "inexact").</div>'
-                );
-            }
-            const itens = [...resultadosAcumulados];
-            if (selectOrdenarGlobal.value === "membros") {
-                const membrosDe = (item) =>
-                    item.chat && item.chat.participantsCount != null ? item.chat.participantsCount : -1;
-                itens.sort((a, b) => membrosDe(b) - membrosDe(a));
-            }
-            if (!itens.length) {
-                lista.insertAdjacentHTML("beforeend", '<div style="color:#8b92a3;">Nada encontrado com esse termo.</div>');
-            } else {
-                for (const item of itens) {
-                    lista.appendChild(criarItemResultadoGlobal(item.m, item.chat, item.termoQueBateu));
-                }
-            }
-            const aindaTemPagina = [...paginasPorTermo.values()].some((p) => p != null);
-            if (aindaTemPagina) {
-                const botaoMais = botaoAcao(lista, "Carregar mais");
-                botaoMais.className = "trp-carregar-mais";
-                botaoMais.addEventListener("click", () => executarBuscaGlobal(true));
-            }
-        }
-
-        // So quando o modo e "membros": busca o numero de membros (ver
-        // garantirParticipantsCount, mais acima) de todo canal/grupo que
-        // ainda nao tem esse numero, ANTES de redesenhar - sem isso a
-        // maioria dos itens ficava empatada em "sem numero" e "Mais
-        // membros" nao reordenava quase nada de verdade (bug reportado pelo
-        // usuario). So uma chamada de API por canal novo (cache evita
-        // repetir o mesmo canal), nunca em paralelo, pra nao arriscar flood
-        // numa busca com muitos resultados. Chamar de novo enquanto ja esta
-        // buscando (troca rapida de "Carregar mais"/seletor) so pula a
-        // enriquecida e redesenha com o que ja tem - a proxima chamada (ou
-        // o fim desta) acerta o resto.
-        let enriquecendoMembrosGlobal = false;
-        async function ordenarERenderizar() {
-            if (selectOrdenarGlobal.value === "membros" && !enriquecendoMembrosGlobal) {
-                enriquecendoMembrosGlobal = true;
-                selectOrdenarGlobal.disabled = true;
-                lista.innerHTML = '<div style="color:#8b92a3;">Carregando numero de membros...</div>';
-                try {
-                    for (const item of resultadosAcumulados) await garantirParticipantsCount(item.chat);
-                } finally {
-                    enriquecendoMembrosGlobal = false;
-                    selectOrdenarGlobal.disabled = false;
-                }
-            }
-            renderizarListaGlobal();
-        }
-
-        async function executarBuscaGlobal(continuar) {
-            const termoBruto = campoBusca.value.trim();
-            if (!termoBruto) {
-                lista.innerHTML = '<div style="color:#8b92a3;">Digita algo pra buscar.</div>';
+        async function executar() {
+            const termo = campoBusca.value.trim();
+            resultados.innerHTML = "";
+            if (!termo) {
+                textoAviso(resultados, "Digite algo pra buscar.", "#ff6b6b");
                 return;
             }
-            const termos = termosDaBusca(termoBruto);
-            if (!termos.length) {
-                lista.innerHTML = '<div style="color:#8b92a3;">Digita pelo menos uma hashtag valida.</div>';
-                return;
-            }
-
-            if (!continuar) {
-                lista.innerHTML = '<div style="color:#8b92a3;">Buscando nos canais/grupos publicos do Telegram...</div>';
-                paginasPorTermo = new Map(
-                    termos.map((t) => [t, { offsetRate: 0, offsetPeer: new Api.InputPeerEmpty({}), offsetId: 0 }])
-                );
-                chavesVistasGlobal.clear();
-                resultadosAcumulados = [];
-                houveInexact = false;
-                historicoBuscaGlobal.registrar(termoBruto);
-                listaLinks.innerHTML = "";
-                linksVistos.clear();
-                tituloLinks.style.display = "none";
-            }
-
+            historicoBuscaGlobal.registrar(termo);
             botaoBuscar.disabled = true;
             try {
-                let erroDeAlgumTermo = null;
-                // So pode estourar em modo texto livre (hashtag nao tem cota
-                // documentada) - guarda o termo que precisaria pagar Stars
-                // pra continuar, pra oferecer o botao de pagamento depois do
-                // loop (nunca durante, nunca automatico).
-                let termoComCotaEstourada = null;
-                // Sequencial (nao em paralelo) de proposito - varios termos
-                // disparando tudo de uma vez arrisca flood wait mesmo sem a
-                // cota/Premium entrarem no caminho (todo metodo da API tem
-                // controle geral de taxa de pedidos, documentado ou nao).
-                for (const termoAtual of termos) {
-                    const pagina = paginasPorTermo.get(termoAtual);
-                    if (!pagina) continue; // esse termo ja esgotou as paginas dele
-                    try {
-                        const parametros = {
-                            offsetRate: pagina.offsetRate,
-                            offsetPeer: pagina.offsetPeer,
-                            offsetId: pagina.offsetId,
-                            limit: 20,
-                        };
-                        if (checkboxHashtag.checked) {
-                            parametros.hashtag = termoAtual;
-                        } else {
-                            parametros.query = termoAtual;
-                        }
-                        const resultado = await cliente.invoke(new Api.channels.SearchPosts(parametros));
-                        processarRespostaDeBusca(resultado, termoAtual, termos.length);
-                    } catch (erro) {
-                        paginasPorTermo.set(termoAtual, null);
-                        const mensagemErro = erro && erro.message ? erro.message : String(erro);
-                        // So em texto livre: cota diaria gratis acabou e a
-                        // conta nao tem Premium - o unico jeito de continuar
-                        // E PAGANDO em Stars (ver buscarPagandoStars). Modo
-                        // hashtag nunca cai aqui (sem essa restricao).
-                        if (!checkboxHashtag.checked && /PREMIUM_ACCOUNT_REQUIRED/i.test(mensagemErro)) {
-                            termoComCotaEstourada = termoAtual;
-                        } else {
-                            erroDeAlgumTermo =
-                                (termos.length > 1 ? termoAtual + ": " : "") + mensagemErro;
-                        }
-                    }
-                }
-
-                await ordenarERenderizar();
-                if (erroDeAlgumTermo) {
-                    lista.insertAdjacentHTML(
-                        "beforeend",
-                        '<div style="color:#ff6b6b;font-size:11px;">Um dos termos deu erro: ' +
-                            escapeHtml(erroDeAlgumTermo) +
-                            "</div>"
-                    );
-                }
-                if (termoComCotaEstourada) {
-                    mostrarBotaoPagarStars(termoComCotaEstourada);
-                }
+                await buscarPorNome(termo);
+                if (lerPreferencia("ba_posts_publicos")) await buscarPostsPublicos(termo);
+                if (lerPreferencia("ba_suas_conversas")) await buscarNasSuasConversas(termo);
             } finally {
                 botaoBuscar.disabled = false;
             }
         }
-
-        // Processa UMA resposta de channels.SearchPosts (pago ou nao) -
-        // compartilhado entre a busca normal (executarBuscaGlobal) e a busca
-        // paga em Stars (buscarPagandoStars), pra garantir que os dois
-        // caminhos atualizam resultadosAcumulados/paginasPorTermo do mesmo
-        // jeito exato.
-        function processarRespostaDeBusca(resultado, termoAtual, totalDeTermos) {
-            const mensagens = resultado.messages || [];
-            const chatsPorId = new Map();
-            for (const c of resultado.chats || []) chatsPorId.set(String(c.id), c);
-
-            if (resultado.inexact) houveInexact = true;
-
-            for (const m of mensagens) {
-                const chatIdMsg = m.peerId && m.peerId.channelId != null ? String(m.peerId.channelId) : "?";
-                const chaveMsg = chatIdMsg + ":" + m.id;
-                if (chavesVistasGlobal.has(chaveMsg)) continue;
-                chavesVistasGlobal.add(chaveMsg);
-
-                const linksDaMensagem = extrairLinksTelegram(m.message);
-                if (checkboxSoComLink.checked && !linksDaMensagem.length) continue;
-
-                resultadosAcumulados.push({
-                    m,
-                    chat: chatsPorId.get(chatIdMsg) || null,
-                    termoQueBateu: totalDeTermos > 1 ? termoAtual : null,
-                });
-                if (checkboxLinks.checked) {
-                    for (const link of linksDaMensagem) criarItemDeLink(link, listaLinks, linksVistos);
-                    if (linksDaMensagem.length) tituloLinks.style.display = "block";
-                }
-            }
-
-            if (mensagens.length) {
-                const ultima = mensagens[mensagens.length - 1];
-                const chatIdUltima = ultima.peerId && ultima.peerId.channelId != null ? String(ultima.peerId.channelId) : null;
-                const chatUltima = chatIdUltima ? chatsPorId.get(chatIdUltima) : null;
-                if (chatUltima && chatUltima.accessHash != null) {
-                    paginasPorTermo.set(termoAtual, {
-                        offsetRate: resultado.nextRate ?? ultima.date,
-                        offsetPeer: new Api.InputPeerChannel({ channelId: chatUltima.id, accessHash: chatUltima.accessHash }),
-                        offsetId: ultima.id,
-                    });
-                } else {
-                    // sem accessHash do ultimo chat nao da pra montar o
-                    // offsetPeer da proxima pagina - esgota esse termo.
-                    paginasPorTermo.set(termoAtual, null);
-                }
-            } else {
-                paginasPorTermo.set(termoAtual, null);
-            }
-        }
-
-        // So chamado por uma acao explicita do usuario (clique no botao com
-        // o valor exato de Stars escrito nele) - NUNCA automatico. A
-        // primeira pagina de uma busca paga e a UNICA que cobra: a doc
-        // oficial diz que toda paginacao seguinte da MESMA busca ("Carregar
-        // mais") volta a ser gratis - por isso isso so roda uma vez por
-        // busca nova, nunca de novo num "Carregar mais".
-        async function buscarPagandoStars(termoAtual, botao) {
-            botao.disabled = true;
-            botao.textContent = "Pagando e buscando...";
-            try {
-                const cotaFresca = await cliente.invoke(new Api.channels.CheckSearchPostsFlood({}));
-                if (cotaFresca.queryIsFree || cotaFresca.remains > 0) {
-                    // Sobrou cota gratis entre a tentativa anterior e agora
-                    // (pouco provavel, mas possivel) - nao cobra Stars a
-                    // toa, so repete a busca normal.
-                    paginasPorTermo.set(termoAtual, { offsetRate: 0, offsetPeer: new Api.InputPeerEmpty({}), offsetId: 0 });
-                    const resultado = await cliente.invoke(
-                        new Api.channels.SearchPosts({
-                            offsetRate: 0,
-                            offsetPeer: new Api.InputPeerEmpty({}),
-                            offsetId: 0,
-                            limit: 20,
-                            query: termoAtual,
-                        })
-                    );
-                    processarRespostaDeBusca(resultado, termoAtual, 1);
-                } else {
-                    const resultado = await cliente.invoke(
-                        new Api.channels.SearchPosts({
-                            offsetRate: 0,
-                            offsetPeer: new Api.InputPeerEmpty({}),
-                            offsetId: 0,
-                            limit: 20,
-                            query: termoAtual,
-                            allowPaidStars: cotaFresca.starsAmount,
-                        })
-                    );
-                    processarRespostaDeBusca(resultado, termoAtual, 1);
-                }
-                await ordenarERenderizar();
-            } catch (erro) {
-                lista.insertAdjacentHTML(
-                    "beforeend",
-                    '<div style="color:#ff6b6b;font-size:11px;">Erro ao pagar e buscar: ' +
-                        escapeHtml(erro && erro.message ? erro.message : String(erro)) +
-                        "</div>"
-                );
-                botao.disabled = false;
-                botao.textContent =
-                    ultimaCota && ultimaCota.starsAmount != null
-                        ? `Pagar ${ultimaCota.starsAmount} Stars e buscar mesmo assim`
-                        : "Pagar em Stars e buscar mesmo assim";
-            }
-        }
-
-        function mostrarBotaoPagarStars(termoAtual) {
-            const bloco = document.createElement("div");
-            bloco.style.cssText = "margin-top:8px;padding-top:8px;border-top:1px solid #2a2f3a;";
-            bloco.innerHTML =
-                '<div style="color:#e0a93a;font-size:11px;margin-bottom:4px;">Cota diaria gratis de texto livre acabou hoje.</div>';
-            const botaoPagar = document.createElement("button");
-            botaoPagar.textContent =
-                ultimaCota && ultimaCota.starsAmount != null
-                    ? `Pagar ${ultimaCota.starsAmount} Stars e buscar mesmo assim`
-                    : "Pagar em Stars e buscar mesmo assim";
-            botaoPagar.style.cssText =
-                "width:100%;padding:8px;border:none;border-radius:6px;background:#e0a93a;color:#1a1a1a;" +
-                "font-weight:600;cursor:pointer;";
-            bloco.appendChild(botaoPagar);
-            lista.appendChild(bloco);
-            botaoPagar.addEventListener("click", () => buscarPagandoStars(termoAtual, botaoPagar));
-        }
-
-        botaoBuscar.addEventListener("click", () => executarBuscaGlobal(false));
+        botaoBuscar.addEventListener("click", executar);
         campoBusca.addEventListener("keydown", (ev) => {
-            if (ev.key === "Enter") executarBuscaGlobal(false);
-        });
-        selectOrdenarGlobal.addEventListener("change", () => {
-            if (resultadosAcumulados.length) ordenarERenderizar();
-        });
-    }
-
-    // Confere se uma mensagem especifica (ex.: algo que apareceu na busca
-    // NATIVA do Telegram mas nao na nossa busca local) ja esta salva no
-    // nosso banco, comparando com o que existe ao vivo no Telegram agora.
-    // Existe pra responder com certeza, sem chute, se um caso de "a busca
-    // nativa acha e a nossa nao" e um buraco real no scan (mensagem existe
-    // mas ainda nao foi escaneada) ou outra coisa (texto editado depois,
-    // mensagem apagada, etc.).
-    async function telaVerificarMensagem() {
-        definirTituloTela("Verificar mensagem");
-        const corpo = corpoDoPainel();
-        botaoVoltar(corpo);
-
-        const aviso = document.createElement("div");
-        aviso.style.cssText = "display:flex;align-items:center;gap:4px;color:#8b92a3;margin-bottom:10px;";
-        aviso.innerHTML =
-            "<span>Confere se uma mensagem especifica ja esta no nosso banco local.</span>" +
-            criarIconeInfoHtml(
-                'Por exemplo, algo que voce viu na busca nativa do Telegram mas nao apareceu em "Buscar mensagens" aqui. Compara com o que existe ao vivo no Telegram agora - serve pra saber se e falta de scan (ainda nao chegou la) ou outra coisa (texto editado depois, mensagem apagada, etc.).'
-            );
-        corpo.appendChild(aviso);
-
-        const db = await abrirBanco();
-        // Mesmo filtro das demais telas - grupo desmarcado em "Configurar
-        // grupos" nao aparece no seletor (ver comentario em
-        // renderizarTabelaChats()).
-        const excluidos = carregarGruposExcluidos();
-        const chats = (await listarChats(db)).filter((c) => !excluidos.has(c.chatId));
-        chats.sort((a, b) => (a.chatTitle || "").localeCompare(b.chatTitle || ""));
-
-        if (!chats.length) {
-            textoAviso(corpo, "Nenhum grupo escaneado ainda. Roda o scan primeiro.", "#ff6b6b");
-            return;
-        }
-
-        const blocoGrupo = document.createElement("div");
-        blocoGrupo.style.marginBottom = "10px";
-        blocoGrupo.innerHTML =
-            '<label style="display:block;color:#8b92a3;margin-bottom:4px;">Grupo/canal</label>' +
-            '<select id="trp-verificar-grupo" style="width:100%;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:8px;box-sizing:border-box;"></select>';
-        corpo.appendChild(blocoGrupo);
-        const selectGrupo = blocoGrupo.querySelector("#trp-verificar-grupo");
-        for (const c of chats) {
-            const opcao = document.createElement("option");
-            opcao.value = c.chatId;
-            opcao.textContent = c.chatTitle || c.chatId;
-            selectGrupo.appendChild(opcao);
-        }
-
-        const campoLink = campoTexto(
-            corpo,
-            'Cola o link da mensagem aqui (opcional, so pra preencher o ID e o grupo sozinho)',
-            "text"
-        );
-        const campoId = campoTexto(
-            corpo,
-            'ID da mensagem (numero no final do link de "Copiar link da mensagem")',
-            "number"
-        );
-
-        // Tenta reconhecer o link (t.me/c/<id>/<msg> ou o link que o proprio
-        // botao "abrir" daqui gera, web.telegram.org/...#<id>?post=<msg>) e
-        // preencher ID + grupo sozinho. Se nao reconhecer o formato, pelo
-        // menos pega o ultimo numero colado como ID da mensagem.
-        campoLink.addEventListener("input", () => {
-            const texto = campoLink.value.trim();
-            if (!texto) return;
-            const selecionarGrupoPorIdBase = (idBase) => {
-                const candidato = chats.find((c) => c.chatId === "-100" + idBase || c.chatId === "-" + idBase);
-                if (candidato) selectGrupo.value = candidato.chatId;
-            };
-            const comC = texto.match(/\/c\/(\d+)\/(\d+)/);
-            if (comC) {
-                campoId.value = comC[2];
-                selecionarGrupoPorIdBase(comC[1]);
-                return;
-            }
-            const comPost = texto.match(/#-?(\d+)\?post=(\d+)/);
-            if (comPost) {
-                campoId.value = comPost[2];
-                selecionarGrupoPorIdBase(comPost[1]);
-                return;
-            }
-            const numeros = texto.match(/\d+/g);
-            if (numeros && numeros.length) campoId.value = numeros[numeros.length - 1];
+            if (ev.key === "Enter") executar();
         });
 
-        const botaoVerificar = botaoAcao(corpo, "Verificar");
-        const resultado = document.createElement("div");
-        resultado.style.marginTop = "10px";
-        corpo.appendChild(resultado);
+        const garantirMembros = criarBuscadorDeMembros();
+        const ordenarChats = async (chats) => {
+            const minimo = lerPreferencia("ba_minimo_membros");
+            if (minimo > 0 || lerPreferencia("ba_ordenar") === "membros") await emParaleloLimitado(chats, 4, garantirMembros);
+            let lista = chats.filter((c) => !minimo || (c.participantsCount || 0) >= minimo);
+            if (lerPreferencia("ba_ordenar") === "membros") lista = [...lista].sort((a, b) => (b.participantsCount ?? -1) - (a.participantsCount ?? -1));
+            return lista;
+        };
 
-        function blocoResultado(titulo, cor, miolo) {
-            return (
-                '<div style="margin-bottom:10px;padding:8px;border:1px solid #2a2f3a;border-radius:6px;">' +
-                '<div style="color:' +
-                cor +
-                ';font-weight:600;margin-bottom:4px;">' +
-                escapeHtml(titulo) +
-                "</div>" +
-                miolo +
-                "</div>"
-            );
-        }
-
-        botaoVerificar.addEventListener("click", async () => {
-            const chatId = selectGrupo.value;
-            const messageId = parseInt(campoId.value, 10);
-            if (!chatId || !messageId) {
-                textoAviso(corpo, "Escolhe o grupo e preenche o ID da mensagem.", "#ff6b6b");
-                return;
-            }
-            botaoVerificar.disabled = true;
-            resultado.innerHTML = '<div style="color:#8b92a3;">Verificando no banco local...</div>';
+        // 2a. nome
+        async function buscarPorNome(termo) {
+            const secao = secaoDeResultado(resultados, "Grupos, canais e pessoas pelo nome");
+            secao.status.textContent = "Buscando...";
             try {
-                const key = chatId + ":" + messageId;
-                const local = await buscarMensagem(db, key);
-
-                const htmlLocal = local
-                    ? blocoResultado(
-                          "No nosso banco local: encontrada",
-                          "#5ec26a",
-                          '<div style="font-size:11px;color:#8b92a3;margin-bottom:2px;">' +
-                              escapeHtml((local.dateUtc || "").slice(0, 10)) +
-                              " - " +
-                              (local.reactionTotal || 0) +
-                              " reacoes</div><div>" +
-                              escapeHtml(local.texto || "") +
-                              "</div>"
-                      )
-                    : blocoResultado(
-                          "No nosso banco local: nao encontrada",
-                          "#ff6b6b",
-                          '<div style="color:#8b92a3;">Essa mensagem ainda nao esta salva (scan nao chegou nela ainda, ou nunca vai chegar por algum motivo).</div>'
-                      );
-
-                resultado.innerHTML = htmlLocal + '<div style="color:#8b92a3;">Buscando ao vivo no Telegram...</div>';
-
-                const entidade = await encontrarEntidadePorChatId(chatId);
-                if (!entidade) {
-                    resultado.innerHTML =
-                        htmlLocal +
-                        blocoResultado(
-                            "Ao vivo no Telegram: erro",
-                            "#ff6b6b",
-                            '<div style="color:#8b92a3;">Nao achei esse grupo entre os dialogs dessa conta agora (saiu do grupo? mudou de id?).</div>'
-                        );
-                    return;
-                }
-
-                const mensagens = await cliente.getMessages(entidade, { ids: [messageId] });
-                const mensagemAoVivo = mensagens && mensagens[0];
-
-                const htmlAoVivo = mensagemAoVivo
-                    ? blocoResultado(
-                          "Ao vivo no Telegram agora: existe",
-                          "#5ec26a",
-                          '<div style="font-size:11px;color:#8b92a3;margin-bottom:2px;">' +
-                              escapeHtml(dataIso(mensagemAoVivo).slice(0, 10)) +
-                              " - " +
-                              extrairReacoes(mensagemAoVivo).total +
-                              " reacoes</div><div>" +
-                              escapeHtml(textoCompleto(mensagemAoVivo)) +
-                              "</div>"
-                      )
-                    : blocoResultado(
-                          "Ao vivo no Telegram agora: nao existe",
-                          "#e0a93a",
-                          '<div style="color:#8b92a3;">Apagada, ou esse ID nao corresponde a nenhuma mensagem nesse grupo.</div>'
-                      );
-
-                resultado.innerHTML = htmlLocal + htmlAoVivo;
-
-                if (!local && mensagemAoVivo) {
-                    resultado.insertAdjacentHTML(
-                        "beforeend",
-                        '<div style="color:#e0a93a;font-size:12px;">Isso confirma um buraco real: a mensagem existe mas o scan ainda nao salvou ela. Se o ultimo scan desse grupo ja passou da data dela e mesmo assim nao achou, e bug de verdade - me avisa com esse caso.</div>'
+                const r = await cliente.invoke(new Api.contacts.Search({ q: termo.replace(/^[@#]/, ""), limit: 30 }));
+                const tipo = lerPreferencia("ba_tipo");
+                const chats = (r.chats || []).filter((c) => tipo === "todos" || tipo === tipoDoChat(c));
+                const pessoas = tipo === "todos" || tipo === "pessoa" ? (r.users || []).filter((u) => !u.self) : [];
+                const ordenados = tipo === "pessoa" ? [] : await ordenarChats(chats);
+                secao.status.textContent = ordenados.length + " grupo(s)/canal(is), " + pessoas.length + " pessoa(s)";
+                for (const chat of ordenados) {
+                    const usuario = chat.username ? "@" + chat.username : null;
+                    const linha = linhaSimples(
+                        secao.lista,
+                        '<span style="color:#4da3ff;">[' + tipoDoChat(chat) + "]</span> " + escapeHtml(chat.title || String(chat.id)) + (usuario ? " (" + escapeHtml(usuario) + ")" : "") +
+                            (chat.participantsCount != null ? ' <span style="color:#8b92a3;">- ' + chat.participantsCount + " membros</span>" : "") +
+                            (buscarChat(db, "-100" + chat.id) ? ' <span style="color:#5ec26a;">- ja esta no scan</span>' : "")
                     );
-                } else if (
-                    local &&
-                    mensagemAoVivo &&
-                    normalizarTexto(local.texto || "") !== normalizarTexto(textoCompleto(mensagemAoVivo))
-                ) {
-                    resultado.insertAdjacentHTML(
-                        "beforeend",
-                        '<div style="color:#e0a93a;font-size:12px;">O texto salvo e diferente do texto ao vivo - ou a mensagem foi editada depois do scan, ou o texto nao foi capturado direito na hora.</div>'
-                    );
+                    if (usuario) linha.appendChild(criarLinkExterno(" abrir", "https://t.me/" + encodeURIComponent(chat.username), "color:#4da3ff;font-size:11px;"));
                 }
+                for (const u of pessoas) {
+                    const id = String(u.id);
+                    const linha = linhaSimples(
+                        secao.lista,
+                        '<span style="color:#8b92a3;">[' + (u.bot ? "bot" : "pessoa") + "]</span> " + escapeHtml(nomeDaEntidade(u)) + (u.username ? " (@" + escapeHtml(u.username) + ")" : "") + " - id " + id
+                    );
+                    if (!u.bot) {
+                        const botao = botaoPequeno(linha, estaMonitorado(id) ? "Ja monitorado" : "Monitorar", async () => {
+                            atualizarRemetente(db, id, u);
+                            await descarregarEscritasPendentes(db);
+                            botao.textContent = (await adicionarMonitorado(db, { id, tipo: "pessoa" })) ? "Monitorando" : "Ja monitorado";
+                            botao.disabled = true;
+                        }, "margin-left:6px;");
+                        if (estaMonitorado(id)) botao.disabled = true;
+                    }
+                }
+                if (!ordenados.length && !pessoas.length) secao.status.textContent = "Nada com esse nome.";
             } catch (erro) {
-                resultado.innerHTML =
-                    '<div style="color:#ff6b6b;">Erro: ' +
-                    escapeHtml(erro && erro.message ? erro.message : String(erro)) +
-                    "</div>";
-            } finally {
-                botaoVerificar.disabled = false;
+                secao.status.textContent = "Erro: " + mensagemDoErro(erro);
+                secao.status.style.color = "#ff6b6b";
             }
-        });
+        }
+
+        // 2b. posts publicos (+ links achados neles)
+        async function buscarPostsPublicos(termoBruto) {
+            const secao = secaoDeResultado(resultados, "Posts de canais publicos");
+            const secaoLinks = lerPreferencia("ba_verificar_links") ? secaoDeResultado(resultados, "Links t.me citados nesses posts (conferidos)") : null;
+            const linksVistos = new Map();
+            const termos = [];
+            for (const parte of termoBruto.split(";")) {
+                const limpo = parte.trim().replace(/^#/, "");
+                if (limpo && !termos.some((t) => t.toLowerCase() === limpo.toLowerCase())) termos.push(limpo);
+                if (termos.length >= 10) break;
+            }
+            const umTermoSo = termos.length === 1;
+            // Texto livre: so com cota gratis (ou Premium). Senao explica.
+            let usarTextoLivre = false;
+            let cota = null;
+            if (umTermoSo) {
+                try {
+                    cota = await cliente.invoke(new Api.channels.CheckSearchPostsFlood({ query: termos[0] }));
+                    usarTextoLivre = !!(cota.queryIsFree || cota.remains > 0);
+                } catch (erro) {
+                    cota = null;
+                }
+            }
+            const acumulados = [];
+            const vistos = new Set();
+            const avisos = [];
+            const pedir = async (parametros, rotulo) => {
+                const resposta = await cliente.invoke(new Api.channels.SearchPosts({ offsetRate: 0, offsetPeer: new Api.InputPeerEmpty({}), offsetId: 0, limit: 30, ...parametros }));
+                const chatsPorId = new Map((resposta.chats || []).map((c) => [String(c.id), c]));
+                for (const m of resposta.messages || []) {
+                    const idCanal = m.peerId && m.peerId.channelId != null ? String(m.peerId.channelId) : "?";
+                    const chave = idCanal + ":" + m.id;
+                    if (vistos.has(chave)) continue;
+                    vistos.add(chave);
+                    const links = extrairLinksTelegram(m.message);
+                    if (lerPreferencia("ba_so_com_link") && !links.length) continue;
+                    acumulados.push({ m, chat: chatsPorId.get(idCanal) || null, rotulo, links });
+                }
+            };
+            secao.status.textContent = "Buscando...";
+            for (const termo of termos) {
+                const hashtag = termo.replace(/\s+/g, "");
+                try {
+                    await pedir({ hashtag }, "#" + hashtag);
+                } catch (erro) {
+                    avisos.push("#" + hashtag + ": " + mensagemDoErro(erro));
+                }
+            }
+            if (umTermoSo) {
+                if (usarTextoLivre) {
+                    try {
+                        await pedir({ query: termos[0] }, "texto");
+                    } catch (erro) {
+                        avisos.push(/PREMIUM_ACCOUNT_REQUIRED/i.test(mensagemDoErro(erro)) ? "Texto livre: o Telegram exigiu conta Premium." : "Texto livre: " + mensagemDoErro(erro));
+                    }
+                } else {
+                    avisos.push(
+                        "Texto livre em posts publicos NAO foi buscado: o Telegram so libera essa busca pra conta Premium ou com cota gratis do dia" +
+                            (cota && cota.totalDaily != null ? " (cota de hoje: " + (cota.remains ?? 0) + " de " + cota.totalDaily + ")" : "") +
+                            ". Busquei pela hashtag #" + termos[0].replace(/\s+/g, "") + " (sempre gratis)."
+                    );
+                    if (cota && cota.starsAmount) {
+                        const botaoPagar = botaoPequeno(secao.bloco, "Pagar " + cota.starsAmount + " Stars e buscar o texto livre mesmo assim", async () => {
+                            botaoPagar.disabled = true;
+                            try {
+                                await pedir({ query: termos[0], allowPaidStars: cota.starsAmount }, "texto (pago)");
+                                await desenhar();
+                                botaoPagar.textContent = "Feito";
+                            } catch (erro) {
+                                botaoPagar.textContent = "Erro: " + mensagemDoErro(erro);
+                            }
+                        }, "background:#e0a93a;color:#1a1a1a;margin-top:4px;");
+                    }
+                }
+            }
+            async function desenhar() {
+                if (lerPreferencia("ba_ordenar") === "membros" || lerPreferencia("ba_minimo_membros") > 0) await emParaleloLimitado(acumulados, 4, (item) => garantirMembros(item.chat));
+                const minimo = lerPreferencia("ba_minimo_membros");
+                let itens = acumulados.filter((i) => !minimo || (i.chat && (i.chat.participantsCount || 0) >= minimo));
+                if (lerPreferencia("ba_ordenar") === "membros") itens = [...itens].sort((a, b) => ((b.chat && b.chat.participantsCount) ?? -1) - ((a.chat && a.chat.participantsCount) ?? -1));
+                else if (lerPreferencia("ba_ordenar") === "data") itens = [...itens].sort((a, b) => b.m.date - a.m.date);
+                secao.lista.innerHTML = "";
+                secao.status.textContent = itens.length + " post(s)" + (avisos.length ? "\n" + avisos.join("\n") : "");
+                for (const { m, chat, rotulo, links } of itens) {
+                    const titulo = (chat && chat.title) || "canal/grupo";
+                    const usuario = chat && chat.username;
+                    const reacoes = extrairReacoes(m).total;
+                    const linha = linhaSimples(
+                        secao.lista,
+                        '<div style="color:#4da3ff;font-weight:600;">' + escapeHtml(titulo) + " (" + tipoDoChat(chat) + ")</div>" +
+                            '<div style="color:#8b92a3;font-size:11px;">' +
+                            escapeHtml([usuario ? "@" + usuario : null, chat && chat.participantsCount != null ? chat.participantsCount + " membros" : null, reacoes ? reacoes + " reacoes" : null, dataIso(m).slice(0, 10), termos.length > 1 || rotulo !== "#" + termos[0] ? rotulo : null].filter(Boolean).join(" - ")) +
+                            "</div><div>" + escapeHtml(truncar((m.message || "").trim(), 200)) + "</div>"
+                    );
+                    if (usuario) linha.appendChild(criarLinkExterno("abrir o post", "https://t.me/" + encodeURIComponent(usuario) + "/" + m.id, "display:block;color:#4da3ff;font-size:11px;margin-top:4px;"));
+                    if (secaoLinks) for (const link of links) if (linksVistos.size < 20 || linksVistos.has((link.ehConvite ? "convite:" : "usuario:") + link.valor.toLowerCase())) criarItemDeLink(link, secaoLinks.lista, linksVistos);
+                }
+                if (secaoLinks) secaoLinks.status.textContent = linksVistos.size ? linksVistos.size + " link(s)" + (linksVistos.size >= 20 ? " (ate 20 por busca)" : "") : "Nenhum link t.me nos posts.";
+            }
+            await desenhar();
+        }
+
+        // 2c. suas conversas (servidor)
+        async function buscarNasSuasConversas(termo) {
+            const secao = secaoDeResultado(resultados, "Nas suas conversas (servidor, todos os chats da conta)");
+            let cursor = { offsetRate: 0, offsetPeer: new Api.InputPeerEmpty({}), offsetId: 0 };
+            let recebidas = 0;
+            let total = 0;
+            let novasSalvas = 0;
+            const carregar = async () => {
+                secao.status.textContent = "Buscando...";
+                try {
+                    const r = await cliente.invoke(new Api.messages.SearchGlobal(parametrosDaBuscaGlobal(termo, lerPreferencia("ba_conversas_tipo"), cursor)));
+                    const chatsPorId = new Map();
+                    for (const c of r.chats || []) chatsPorId.set(c.className === "Channel" ? "-100" + c.id : "-" + c.id, c);
+                    for (const u of r.users || []) chatsPorId.set(String(u.id), u);
+                    const chatIdDoPeer = (p) => (p.channelId != null ? "-100" + p.channelId : p.chatId != null ? "-" + p.chatId : p.userId != null ? String(p.userId) : null);
+                    const todas = r.messages || [];
+                    const mensagens = todas.filter((m) => m.className === "Message");
+                    for (const m of mensagens) {
+                        const p = m.peerId || {};
+                        const chatId = p.channelId != null ? "-100" + p.channelId : p.chatId != null ? "-" + p.chatId : p.userId != null ? String(p.userId) : null;
+                        if (!chatId) continue;
+                        const chat = chatsPorId.get(chatId);
+                        const titulo = (buscarChat(db, chatId) || {}).chatTitle || (chat && chat.title) || "conversa " + chatId;
+                        const noScan = !!buscarChat(db, chatId);
+                        let registro = { key: chatId + ":" + m.id, chatId, messageId: m.id, dateUtc: dataIso(m), texto: textoCompleto(m), chatTitle: titulo };
+                        aplicarDadosDaMensagem(registro, m);
+                        // Grupo do scan: grava (nova entra, ja salva tem as
+                        // reacoes atualizadas - mesma ideia da busca ao vivo).
+                        if (noScan) {
+                            registro = montarRegistroDoScan(db, chatId, titulo, m);
+                            if (!db.indice.has(registro.key)) {
+                                novasSalvas++;
+                                registro.achadoNoServidor = true;
+                            }
+                            await salvarMensagem(db, registro, { adiarGravacao: true });
+                        }
+                        total++;
+                        const item = criarItemDeMensagem(db, { ...registro, visto: noScan ? (db.indice.get(registro.key) || {}).visto : false }, {
+                            titulo: registro.dateUtc.slice(0, 10) + " - " + titulo + (noScan ? "" : " (fora do scan)"),
+                            texto: registro.texto,
+                            tamanhoTexto: 200,
+                            semMonitorar: !noScan,
+                        });
+                        secao.lista.appendChild(item);
+                    }
+                    await descarregarEscritasPendentes(db);
+                    // Pagina pela ULTIMA mensagem devolvida (inclusive de
+                    // servico) e pelo peer dela - conversa privada inclusa.
+                    recebidas += todas.length;
+                    const proxima = proximaPaginaDaBuscaGlobal(r, recebidas, (ultima) => {
+                        const chat = chatsPorId.get(chatIdDoPeer(ultima.peerId || {}));
+                        return chat ? inputPeerDoChat(chat) : null;
+                    });
+                    const temMais = !!proxima;
+                    if (temMais) cursor = proxima;
+                    secao.status.textContent =
+                        total + " mensagem(ns)" + (typeof r.count === "number" ? " de " + r.count + " no servidor" : "") +
+                        (novasSalvas ? " - " + novasSalvas + " de grupos do scan que faltavam foram salvas agora" : "") + (temMais ? "" : " (fim)");
+                    const antigo = secao.bloco.querySelector && secao.bloco.querySelector(".trp-mais-conversas");
+                    if (antigo) antigo.remove();
+                    if (temMais) {
+                        const mais = botaoAcao(secao.bloco, "Carregar mais");
+                        mais.className = "trp-mais-conversas";
+                        mais.addEventListener("click", () => {
+                            mais.remove();
+                            carregar();
+                        });
+                    }
+                } catch (erro) {
+                    secao.status.textContent = "Erro: " + mensagemDoErro(erro);
+                    secao.status.style.color = "#ff6b6b";
+                }
+            };
+            await carregar();
+        }
+
+        if (pedido && pedido.executar && campoBusca.value.trim()) executar();
     }
 
     function escapeHtml(texto) {
@@ -173781,6 +173948,4278 @@ window.TRP_VERSAO = "2026.10.13.2";
         div.textContent = texto == null ? "" : texto;
         return div.innerHTML;
     }
+
+    // Na linha abaixo montar_userscript.mjs insere ferramentas_fundo.js
+    // (dentro desta funcao, sem variavel global nova).
+    // ==== Preferencias do usuario (rodada 4) ====
+    //
+    // Toda caixinha, seletor, limite e filtro das telas fica guardado aqui,
+    // no armazenamento do Tampermonkey (GM_setValue), com a chave
+    // "trp_pref_<nome>". Antes cada tela comecava do zero a cada abertura
+    // ("Ocultar vistos" voltava desmarcado sempre). Padrao unico:
+    //   1. a preferencia e declarada uma vez (definirPreferencia) com secao,
+    //      valor padrao e tipo;
+    //   2. a tela liga o controle a ela (ligarCampoAPreferencia,
+    //      quadradoDaPreferencia) - o valor salvo entra na criacao e cada
+    //      mudanca e gravada na hora;
+    //   3. a tela Configuracoes lista tudo por secao, com "Voltar ao padrao".
+    // Valor salvo invalido (tipo errado, fora do limite, opcao que nao
+    // existe mais) cai no padrao, nunca quebra a tela.
+
+    const PREFIXO_PREFERENCIA = "trp_pref_";
+    const PREFERENCIAS = new Map(); // nome -> { nome, secao, padrao, tipo, rotulo, opcoes, min, max, naTelaDeConfig }
+
+    const SECOES_DE_PREFERENCIAS = [
+        { id: "listas", titulo: "Listas e buscas (Top reacoes, Minhas reacoes, Buscar mensagens)" },
+        { id: "busca_avancada", titulo: "Busca avancada" },
+        { id: "scan", titulo: "Scan e download em lote" },
+        { id: "downloads", titulo: "Downloads" },
+        { id: "monitorados", titulo: "Monitorados" },
+    ];
+
+    function definirPreferencia(nome, definicao) {
+        PREFERENCIAS.set(nome, { nome, tipo: typeof definicao.padrao === "boolean" ? "booleano" : typeof definicao.padrao === "number" ? "numero" : "texto", naTelaDeConfig: true, ...definicao });
+    }
+
+    function valorValido(definicao, valor) {
+        if (valor === undefined || valor === null) return definicao.padrao;
+        if (definicao.tipo === "booleano") return valor === true || valor === false ? valor : definicao.padrao;
+        if (definicao.tipo === "numero") {
+            const numero = Number(valor);
+            if (!isFinite(numero) || valor === "") return definicao.padrao;
+            const minimo = definicao.min != null ? definicao.min : -Infinity;
+            const maximo = definicao.max != null ? definicao.max : Infinity;
+            return Math.min(maximo, Math.max(minimo, Math.round(numero)));
+        }
+        const texto = typeof valor === "string" ? valor : String(valor);
+        if (definicao.opcoes && !definicao.opcoes.some((o) => o.valor === texto)) return definicao.padrao;
+        return texto;
+    }
+
+    function lerPreferencia(nome) {
+        const definicao = PREFERENCIAS.get(nome);
+        if (!definicao) throw new Error("preferencia nao declarada: " + nome);
+        return valorValido(definicao, GM_getValue(PREFIXO_PREFERENCIA + nome, undefined));
+    }
+
+    function gravarPreferencia(nome, valor) {
+        const definicao = PREFERENCIAS.get(nome);
+        if (!definicao) throw new Error("preferencia nao declarada: " + nome);
+        GM_setValue(PREFIXO_PREFERENCIA + nome, valorValido(definicao, valor));
+    }
+
+    function preferenciasDaSecao(secao) {
+        return [...PREFERENCIAS.values()].filter((p) => p.secao === secao);
+    }
+
+    // "Voltar ao padrao" de uma secao: grava o padrao de cada preferencia
+    // dela (o armazenamento do Tampermonkey nao tem "apagar" liberado
+    // neste script - so GM_setValue/GM_getValue).
+    function voltarSecaoAoPadrao(secao) {
+        for (const definicao of preferenciasDaSecao(secao)) GM_setValue(PREFIXO_PREFERENCIA + definicao.nome, definicao.padrao);
+        for (const extra of aoVoltarSecaoAoPadrao) {
+            try {
+                extra(secao);
+            } catch (erro) {
+                console.warn("[Gestor TLGR] voltar ao padrao:", erro);
+            }
+        }
+    }
+    const aoVoltarSecaoAoPadrao = []; // ferramentas/monitorados que guardam config fora deste registro
+
+    // Liga um <select>/<input> a uma preferencia: valor salvo na criacao,
+    // cada mudanca gravada na hora. Select de grupo (opcoes que mudam):
+    // se o grupo salvo nao existe mais na lista, fica em "Todos".
+    function ligarCampoAPreferencia(campo, nome) {
+        const valor = lerPreferencia(nome);
+        campo.value = valor === null || valor === undefined ? "" : String(valor);
+        if (campo.tagName === "SELECT" && campo.value !== String(valor)) campo.value = "";
+        const gravar = () => gravarPreferencia(nome, campo.type === "number" ? (campo.value === "" ? null : Number(campo.value)) : campo.value);
+        campo.addEventListener("change", gravar);
+        return campo;
+    }
+
+    // Select cujas opcoes chegam depois (ex.: grupos do scan, carregados
+    // da rede): aplica o valor salvo quando as opcoes ja estiverem la.
+    function aplicarPreferenciaNoSelect(select, nome) {
+        const valor = String(lerPreferencia(nome));
+        if ([...select.options].some((o) => o.value === valor)) select.value = valor;
+    }
+
+    function quadradoDaPreferencia(nome, aoAlternar) {
+        return criarQuadradoMarcavel(lerPreferencia(nome), (marcado) => {
+            gravarPreferencia(nome, marcado);
+            if (aoAlternar) aoAlternar(marcado);
+        });
+    }
+
+    // Linha "caixinha + texto + i" ligada a uma preferencia.
+    function linhaDeQuadrado(corpo, nome, rotulo, info, aoAlternar) {
+        const bloco = document.createElement("div");
+        bloco.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:12px;";
+        const quadrado = quadradoDaPreferencia(nome, aoAlternar);
+        const texto = document.createElement("span");
+        texto.style.cssText = "color:#8b92a3;display:flex;align-items:center;gap:4px;";
+        texto.innerHTML = "<span>" + escapeHtml(rotulo) + "</span>" + (info ? criarIconeInfoHtml(info) : "");
+        bloco.appendChild(quadrado.elemento);
+        bloco.appendChild(texto);
+        corpo.appendChild(bloco);
+        return quadrado;
+    }
+
+    // ---- declaracoes ----
+    const OPCOES_ORDENAR = [
+        { valor: "reacoes", rotulo: "Mais reacoes" },
+        { valor: "data", rotulo: "Mais recentes" },
+    ];
+    // Listas
+    definirPreferencia("itens_por_pagina", { secao: "listas", padrao: 50, min: 10, max: 500, rotulo: "Itens por pagina (Top reacoes, Minhas reacoes, Monitorados; Buscar mensagens usa o dobro)" });
+    definirPreferencia("top_grupo", { secao: "listas", padrao: "", rotulo: "Top reacoes: grupo", naTelaDeConfig: false });
+    definirPreferencia("top_ordenar", { secao: "listas", padrao: "reacoes", opcoes: OPCOES_ORDENAR, rotulo: "Top reacoes: ordenar por" });
+    definirPreferencia("top_minimo", { secao: "listas", padrao: 1, min: 0, max: 1000000, rotulo: "Top reacoes: minimo de reacoes" });
+    definirPreferencia("top_data_de", { secao: "listas", padrao: "", rotulo: "Top reacoes: de (data)", naTelaDeConfig: false });
+    definirPreferencia("top_data_ate", { secao: "listas", padrao: "", rotulo: "Top reacoes: ate (data)", naTelaDeConfig: false });
+    definirPreferencia("top_ocultar_vistos", { secao: "listas", padrao: false, rotulo: "Top reacoes: ocultar as ja vistas" });
+    definirPreferencia("top_emoji", { secao: "listas", padrao: "", rotulo: "Top reacoes: so com esta reacao", naTelaDeConfig: false });
+    definirPreferencia("top_midia", { secao: "listas", padrao: "", rotulo: "Top reacoes: tipo de midia", naTelaDeConfig: false });
+    definirPreferencia("minhas_grupo", { secao: "listas", padrao: "", rotulo: "Minhas reacoes: grupo", naTelaDeConfig: false });
+    definirPreferencia("minhas_data_de", { secao: "listas", padrao: "", rotulo: "Minhas reacoes: de", naTelaDeConfig: false });
+    definirPreferencia("minhas_data_ate", { secao: "listas", padrao: "", rotulo: "Minhas reacoes: ate", naTelaDeConfig: false });
+    definirPreferencia("minhas_emoji", { secao: "listas", padrao: "", rotulo: "Minhas reacoes: so com esta reacao", naTelaDeConfig: false });
+    definirPreferencia("minhas_midia", { secao: "listas", padrao: "", rotulo: "Minhas reacoes: tipo de midia", naTelaDeConfig: false });
+    definirPreferencia("busca_emoji", { secao: "listas", padrao: "", rotulo: "Buscar mensagens: so com esta reacao", naTelaDeConfig: false });
+    definirPreferencia("busca_midia", { secao: "listas", padrao: "", rotulo: "Buscar mensagens: tipo de midia", naTelaDeConfig: false });
+    definirPreferencia("minhas_ocultar_vistos", { secao: "listas", padrao: false, rotulo: "Minhas reacoes: ocultar as ja vistas" });
+    definirPreferencia("busca_grupo", { secao: "listas", padrao: "", rotulo: "Buscar mensagens: grupo", naTelaDeConfig: false });
+    definirPreferencia("busca_ordenar", { secao: "listas", padrao: "data", opcoes: OPCOES_ORDENAR, rotulo: "Buscar mensagens: ordenar por" });
+    definirPreferencia("busca_minimo", { secao: "listas", padrao: 0, min: 0, max: 1000000, rotulo: "Buscar mensagens: minimo de reacoes" });
+    definirPreferencia("busca_data_de", { secao: "listas", padrao: "", rotulo: "Buscar mensagens: de", naTelaDeConfig: false });
+    definirPreferencia("busca_data_ate", { secao: "listas", padrao: "", rotulo: "Buscar mensagens: ate", naTelaDeConfig: false });
+    definirPreferencia("busca_servidor", { secao: "listas", padrao: false, rotulo: "Buscar mensagens: tambem buscar ao vivo no servidor" });
+    definirPreferencia("busca_servidor_limite", { secao: "listas", padrao: 300, min: 50, max: 3000, rotulo: "Buscar mensagens: quantas mensagens trazer do servidor por busca" });
+    definirPreferencia("busca_ocultar_vistos", { secao: "listas", padrao: false, rotulo: "Buscar mensagens: ocultar as ja vistas" });
+    definirPreferencia("busca_so_link", { secao: "listas", padrao: false, rotulo: "Buscar mensagens: so mensagens com link" });
+    definirPreferencia("atualizar_reacoes_dias", { secao: "listas", padrao: 30, min: 1, max: 3650, rotulo: '"Atualizar reacoes pelo servidor": quantos dias para tras' });
+    // Busca avancada
+    definirPreferencia("ba_tipo", { secao: "busca_avancada", padrao: "todos", opcoes: [{ valor: "todos", rotulo: "Tudo" }, { valor: "canal", rotulo: "So canais" }, { valor: "grupo", rotulo: "So grupos" }, { valor: "pessoa", rotulo: "So pessoas" }], rotulo: "Mostrar nos resultados de nome" });
+    definirPreferencia("ba_ordenar", { secao: "busca_avancada", padrao: "relevancia", opcoes: [{ valor: "relevancia", rotulo: "Como o Telegram devolveu" }, { valor: "membros", rotulo: "Mais membros" }, { valor: "data", rotulo: "Mais recentes (posts)" }], rotulo: "Ordenar grupos/canais e posts por" });
+    definirPreferencia("ba_minimo_membros", { secao: "busca_avancada", padrao: 0, min: 0, max: 100000000, rotulo: "Minimo de membros (grupos/canais)" });
+    definirPreferencia("ba_posts_publicos", { secao: "busca_avancada", padrao: true, rotulo: "Buscar posts publicos (hashtag; texto livre quando o Telegram deixar de graca)" });
+    definirPreferencia("ba_suas_conversas", { secao: "busca_avancada", padrao: true, rotulo: "Buscar tambem nas suas conversas (servidor, todos os chats da conta)" });
+    definirPreferencia("ba_conversas_tipo", {
+        secao: "busca_avancada",
+        padrao: "todos",
+        opcoes: [
+            { valor: "todos", rotulo: "Todas as conversas" },
+            { valor: "grupos", rotulo: "So grupos" },
+            { valor: "canais", rotulo: "So canais" },
+            { valor: "privados", rotulo: "So conversas privadas" },
+        ],
+        rotulo: '"Nas suas conversas": buscar em',
+    });
+    definirPreferencia("ba_so_com_link", { secao: "busca_avancada", padrao: false, rotulo: "Posts: so os que citam link t.me" });
+    definirPreferencia("ba_verificar_links", { secao: "busca_avancada", padrao: true, rotulo: "Conferir os links t.me achados nos posts (ate 20 por busca)" });
+    // Scan e lote
+    definirPreferencia("scan_grupo", { secao: "scan", padrao: "", rotulo: "Escanear: grupo escolhido", naTelaDeConfig: false });
+    definirPreferencia("lote_grupo", { secao: "scan", padrao: "", rotulo: "Lote: grupo", naTelaDeConfig: false });
+    definirPreferencia("lote_tipos", { secao: "scan", padrao: "video", rotulo: "Lote: tipos de midia", naTelaDeConfig: false });
+    definirPreferencia("lote_data_de", { secao: "scan", padrao: "", rotulo: "Lote: de", naTelaDeConfig: false });
+    definirPreferencia("lote_data_ate", { secao: "scan", padrao: "", rotulo: "Lote: ate", naTelaDeConfig: false });
+    definirPreferencia("lote_minimo", { secao: "scan", padrao: 0, min: 0, max: 1000000, rotulo: "Lote: minimo de reacoes", naTelaDeConfig: false });
+    // Downloads
+    definirPreferencia("dl_caminho_base", {
+        secao: "downloads",
+        padrao: "C:\\Projetos\\PROJETOS_MAESTRO\\TELEGRAM_TOP_REACOES\\Armazenamento_APP",
+        rotulo: "Caminho da pasta de dados no Windows (o navegador nao informa; usado so pelo Copiar caminho)",
+    });
+    definirPreferencia("dl_caminho_downloads", {
+        secao: "downloads",
+        padrao: "",
+        rotulo: "Caminho no Windows da pasta de downloads separada (so se voce escolheu uma; usado pelo Copiar caminho)",
+    });
+    definirPreferencia("dl_simultaneos", { secao: "downloads", padrao: 2, min: 1, max: 4, rotulo: "Downloads ao mesmo tempo" });
+    // Monitorados
+    definirPreferencia("mon_auto", { secao: "monitorados", padrao: false, rotulo: "Verificar no servidor sozinho enquanto a aba estiver aberta" });
+    definirPreferencia("mon_auto_minutos", { secao: "monitorados", padrao: 60, min: 10, max: 1440, rotulo: "A cada quantos minutos" });
+    definirPreferencia("mon_maximo_por_grupo", { secao: "monitorados", padrao: 300, min: 20, max: 5000, rotulo: "Verificar agora: maximo de mensagens por pessoa e grupo em cada verificacao" });
+    // ==== Fim das preferencias ====
+
+    // ==== Ferramentas em segundo plano - nucleo ====
+    //
+    // Este arquivo (e ferramenta_lote.js / ferramenta_links.js, logo
+    // depois dele) e inserido por montagem.mjs DENTRO da funcao principal
+    // de painel_logic.js, no marcador "@@FERRAMENTAS_FUNDO@@": enxerga as
+    // mesmas variaveis do painel (cliente, Api, conectarComSessaoSalva,
+    // encontrarEntidadePorChatId, lerPastaSalva, ...) sem criar nenhuma
+    // variavel global na pagina.
+    //
+    // Regras (ver HISTORICO_TECNICO.md, auditoria 2026-10): nada aqui mexe
+    // no service worker do Telegram Web, usa as URLs /k/stream/, navega ou
+    // abre aba. So le o DOM e usa o NOSSO cliente MTProto. Ferramenta
+    // desligada = o clique passa direto, sem nenhum efeito.
+    //
+    // Conteudo deste arquivo:
+    //   1. ids do Telegram Web (K e A) -> chatId/messageId do painel
+    //   2. achar o chat (dialogs, @usuario do endereco)
+    //   3. chamadas com pausa de flood tratada aqui (sem mexer no scan)
+    //   4. alvo da midia (documento, foto no maior tamanho, previa de link)
+    //   5. gravadores (pasta Downloads_TLGR em pedacos, ou memoria pra
+    //      arquivo pequeno)
+    //   6. motor de download por pedacos (paralelo, ordem garantida,
+    //      memoria limitada, cancelavel)
+    //   7. fila + central de downloads (aviso no canto)
+    //   8. Alt+clique
+
+    const CHAVE_FERRAMENTA_BAIXAR_MIDIA = "trp_ferramenta_baixar_midia";
+    const OFFSET_ID_CANAL_TWEB = 4294967296; // 2^32 - MESSAGE_ID_OFFSET do tweb (src/lib/appManagers/constants.ts)
+
+    // Quantos downloads rodam ao mesmo tempo: preferencia "dl_simultaneos"
+    // (Configuracoes > Downloads, padrao 2); o resto espera na fila.
+    // Pedaco pedido ao Telegram: 512 KB e o padrao do agendador de midia do
+    // teleproto (MediaScheduler) - divide 1 MB, entao nenhum pedaco cruza
+    // a fronteira de 1 MB que o upload.getFile exige.
+    const TAMANHO_PEDACO = 512 * 1024;
+    // Quantos pedacos de UM download podem estar pedidos ao mesmo tempo, e
+    // quantos podem chegar ANTES do pedaco que esta na vez de ser gravado
+    // (o resto espera - e o que limita a memoria: 64 x 512 KB = 32 MB por
+    // download, qualquer que seja o tamanho do arquivo). Quem decide
+    // quantos vao de fato pra rede e o agendador do teleproto (janela por
+    // conexao, 2 a 8 conexoes, abre conexao nova conforme o download
+    // anda); pedir 64 deixa ele chegar no mesmo teto do caminho antigo (48
+    // pedidos, 6-7 conexoes). Medido (medir_download.mjs, 1 GB, 150 ms por
+    // pedaco, mediana de 3): 32/32 = 89,5 MB/s, 48/48 e 64/64 = 101,4 MB/s,
+    // antigo = 70,3 MB/s. No PC do usuario 32/32 ficou 8% abaixo do antigo
+    // (rodada 4); acima de 64 nao ganha nada e gasta mais memoria.
+    const PEDACOS_EM_PARALELO = 64;
+    const JANELA_DE_PEDACOS = 64;
+    // Sem a pasta de dados (permissao negada ou nunca escolhida), o arquivo
+    // inteiro precisa caber na memoria da aba ate virar download do
+    // navegador. Acima disso, recusa e explica como liberar a pasta. Valor
+    // medido: ver HISTORICO_TECNICO.md (rodada 3, "Limite sem pasta").
+    const LIMITE_BYTES_SEM_PASTA = 200 * 1024 * 1024;
+    const PASTA_DOWNLOADS = "Downloads_TLGR";
+    const BLOCO_DE_ESCRITA = 4 * 1024 * 1024; // ver criarGravadorNaPasta
+
+    function ferramentaBaixarMidiaLigada() {
+        return GM_getValue(CHAVE_FERRAMENTA_BAIXAR_MIDIA, true) !== false;
+    }
+
+    function ligarFerramentaBaixarMidia(ligada) {
+        GM_setValue(CHAVE_FERRAMENTA_BAIXAR_MIDIA, !!ligada);
+        if (ligada) carregarPastaParaDownloads();
+    }
+
+    // ---- 1. ids do Telegram Web ----
+
+    // Telegram Web K: peerId de grupo/canal e negativo SEM o "100"; o mid
+    // de mensagem de canal/supergrupo e 2^32 + id real
+    // (appMessagesIdsManager.ts, generateMessageId) e o de chat
+    // privado/grupo basico e o id real. Painel: chatId no formato Bot API
+    // ("-100<id>" canal/supergrupo, "-<id>" grupo basico, "<id>"
+    // usuario). Devolve null se nao for um id de mensagem de servidor
+    // (mensagem ainda enviando tem mid fracionario; patrocinada/efemera
+    // nao tem id de servidor).
+    function converterIdsDoTelegramWeb(peerIdTexto, midTexto) {
+        const peerId = Number(peerIdTexto);
+        const mid = Number(midTexto);
+        if (!Number.isInteger(peerId) || peerId === 0) return null;
+        if (!Number.isInteger(mid) || mid <= 0 || mid >= OFFSET_ID_CANAL_TWEB * 2) return null;
+        const ehCanal = mid >= OFFSET_ID_CANAL_TWEB;
+        const messageId = ehCanal ? mid - OFFSET_ID_CANAL_TWEB : mid;
+        if (messageId <= 0) return null;
+        let chatId;
+        if (peerId > 0) {
+            if (ehCanal) return null; // usuario nunca tem id de canal - combinacao inesperada, melhor nao chutar
+            chatId = String(peerId);
+        } else {
+            chatId = ehCanal ? "-100" + -peerId : String(peerId);
+        }
+        return { chatId, messageId };
+    }
+
+    // Telegram Web K: o endereco do chat aberto e "#@usuario" quando o
+    // chat tem nome publico e "#<peerId>" quando nao tem
+    // (appImManager.ts, overrideHash). O @usuario e o que permite achar um
+    // canal publico que a conta so esta espiando (nao esta nos dialogs).
+    function usuarioDoEnderecoK(hash) {
+        const achado = /^#@([A-Za-z0-9_]{4,32})(?:[?&]|$)/.exec(hash || "");
+        return achado ? achado[1] : null;
+    }
+
+    function idsDoTelegramWebK(alvo) {
+        const comMid = alvo.closest("[data-mid]");
+        if (!comMid) return null;
+        // Procura o data-peer-id A PARTIR do balao (elemento com data-mid),
+        // nao do ponto clicado: dentro do balao ha elementos com o id de
+        // quem MANDOU a mensagem (nome, avatar), que nao e o chat.
+        const comPeer = comMid.closest("[data-peer-id]");
+        let peerIdTexto = comPeer ? comPeer.getAttribute("data-peer-id") : null;
+        if (!peerIdTexto) {
+            const topo = document.querySelector(".chat.active .chat-info [data-peer-id]");
+            peerIdTexto = topo ? topo.getAttribute("data-peer-id") : null;
+        }
+        const ids = converterIdsDoTelegramWeb(peerIdTexto, comMid.getAttribute("data-mid"));
+        if (ids) ids.usuarioDoChat = usuarioDoEnderecoK(location.hash);
+        return ids;
+    }
+
+    // Telegram Web A (web.telegram.org/a/), conferido no codigo-fonte
+    // (github.com/Ajaxy/telegram-tt): cada mensagem tem data-message-id com
+    // o id REAL; item de album tem id="album-media-message-<id>"; o chat
+    // aberto esta no endereco "#<chatId>" ou "#<chatId>_<topico>", com o
+    // chatId ja no formato Bot API ("-100..." pra canal) - o mesmo do
+    // painel. Nao testado no Telegram real.
+    function idsDoTelegramWebA(alvo, hash) {
+        const chat = /^#(-?\d+)(?:_|$)/.exec(hash || "");
+        if (!chat) return null;
+        let messageId = null;
+        const itemDeAlbum = alvo.closest('[id^="album-media-message-"]');
+        if (itemDeAlbum) {
+            const achado = /^album-media-message-(\d+)$/.exec(itemDeAlbum.getAttribute("id") || "");
+            if (achado) messageId = Number(achado[1]);
+        }
+        if (!messageId) {
+            const mensagem = alvo.closest("[data-message-id]");
+            if (mensagem) messageId = Number(mensagem.getAttribute("data-message-id"));
+        }
+        if (!Number.isInteger(messageId) || messageId <= 0) return null;
+        return { chatId: chat[1], messageId, usuarioDoChat: null };
+    }
+
+    function idsDoElementoClicado(alvo) {
+        if (!alvo || !alvo.closest) return null;
+        if (location.pathname.startsWith("/a")) return idsDoTelegramWebA(alvo, location.hash);
+        return idsDoTelegramWebK(alvo);
+    }
+
+    // ---- 2. achar o chat ----
+
+    async function obterClienteParaFerramentas() {
+        const conectado = await conectarComSessaoSalva();
+        if (!conectado) throw new Error('faca login uma vez pelo botao "Gestor TLGR" antes');
+        return conectado;
+    }
+
+    function erroComMensagem(texto, extra) {
+        const erro = new Error(texto);
+        if (extra) Object.assign(erro, extra);
+        return erro;
+    }
+
+    // 1o: dialogs da conta (cache do painel). 2o: canal publico que a conta
+    // so esta espiando - resolve pelo @usuario do endereco
+    // (contacts.resolveUsername) e confere se o id bate. Sem nada disso, o
+    // chat e privado e a conta nao participa: nao da pra pedir a mensagem
+    // ao Telegram (falta o access_hash), e a mensagem de erro diz isso.
+    async function resolverChatParaFerramentas(cli, chatId, usuarioDoChat, ctx) {
+        const doDialog = await chamarComPausaLocal(() => encontrarEntidadePorChatId(chatId), ctx);
+        if (doDialog) return doDialog;
+        if (usuarioDoChat) {
+            let resolvido;
+            try {
+                resolvido = await chamarComPausaLocal(
+                    () => cli.invoke(new Api.contacts.ResolveUsername({ username: usuarioDoChat }), undefined, { floodSleepThreshold: 0 }),
+                    ctx
+                );
+            } catch (erro) {
+                throw erroComMensagem("nao consegui achar @" + usuarioDoChat + " (" + mensagemDoErro(erro) + ")");
+            }
+            const idPuro = chatId.replace(/^-100/, "").replace(/^-/, "");
+            const candidatos = [...((resolvido && resolvido.chats) || []), ...((resolvido && resolvido.users) || [])];
+            const entidade = candidatos.find((c) => String(c.id) === idPuro);
+            if (entidade) return entidade;
+        }
+        throw erroComMensagem(
+            "esse chat nao esta nos seus grupos/canais e nao tem @usuario publico - " +
+                "e privado e a sua conta nao participa dele, entao o Telegram nao deixa pedir a mensagem"
+        );
+    }
+
+    // ---- 3. pausa de flood tratada aqui ----
+
+    function mensagemDoErro(erro) {
+        return erro && erro.message ? erro.message : String(erro);
+    }
+
+    // Segundos de espera pedidos pelo Telegram, ou 0 se o erro nao e de
+    // flood. FloodWaitError do teleproto tem .seconds; o texto
+    // FLOOD_WAIT_X / FLOOD_PREMIUM_WAIT_X tambem serve.
+    function segundosDeFlood(erro) {
+        if (!erro) return 0;
+        if (typeof erro.seconds === "number" && erro.seconds > 0) return erro.seconds;
+        const texto = erro.errorMessage || "";
+        const achado = /^FLOOD_(?:PREMIUM_)?WAIT_(\d+)$/.exec(texto);
+        return achado ? Number(achado[1]) : 0;
+    }
+
+    // FLOOD_PREMIUM_WAIT_X: o Telegram reduzindo a velocidade de download
+    // de conta SEM Premium. Nao e erro: e esperar e continuar. Antes contava
+    // como pausa comum - depois de 20 o download falhava e o aviso nao dizia
+    // o motivo (rodada 5).
+    function ehLimiteDePremium(erro) {
+        return /^FLOOD_PREMIUM_WAIT_/.test((erro && erro.errorMessage) || "");
+    }
+    const MAXIMO_DE_PAUSAS_DE_PREMIUM = 2000; // na pratica sem limite; so pra nunca ficar num laco eterno
+    const TEXTO_LIMITE_PREMIUM = "o Telegram esta reduzindo a velocidade (conta sem Premium) - continua sozinho, so mais devagar";
+
+    function erroDeCancelado() {
+        return erroComMensagem("cancelado", { cancelado: true });
+    }
+
+    // Espera "segundos" mostrando a contagem no aviso; para na hora se o
+    // download for cancelado.
+    async function esperarComContagem(segundos, ctx, premium) {
+        if (premium && ctx) ctx.limitePremium = true;
+        for (let restante = segundos; restante > 0; restante--) {
+            if (ctx && ctx.sinal && ctx.sinal.aborted) throw erroDeCancelado();
+            if (ctx && ctx.aoPausa) ctx.aoPausa(restante, !!premium);
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+        if (ctx && ctx.aoPausa) ctx.aoPausa(0, !!premium);
+    }
+
+    // Roda "chamada" e, se o Telegram pedir pausa (flood wait), espera o
+    // tempo pedido COM contagem no aviso e tenta de novo. As chamadas
+    // diretas (invoke) daqui usam floodSleepThreshold: 0 POR CHAMADA, entao
+    // nao dependem (nem mexem) do valor global que o scan muda.
+    const MAXIMO_DE_PAUSAS = 20;
+    async function chamarComPausaLocal(chamada, ctx) {
+        let pausas = 0;
+        let pausasDePremium = 0;
+        for (;;) {
+            try {
+                return await chamada();
+            } catch (erro) {
+                const segundos = segundosDeFlood(erro);
+                const premium = ehLimiteDePremium(erro);
+                if (!segundos || (premium ? pausasDePremium++ >= MAXIMO_DE_PAUSAS_DE_PREMIUM : pausas++ >= MAXIMO_DE_PAUSAS)) throw erro;
+                if (!premium && ctx && ctx.maximoSegundosDePausa && segundos > ctx.maximoSegundosDePausa) {
+                    throw erroComMensagem("o Telegram pediu pausa de " + segundos + "s - tente de novo mais tarde");
+                }
+                await esperarComContagem(segundos, ctx, premium);
+            }
+        }
+    }
+
+    // Pede mensagens pelo id, direto na API (channels.getMessages em
+    // canal/supergrupo, messages.getMessages no resto), com a pausa de
+    // flood tratada aqui. Devolve um Map id -> mensagem (so as que existem).
+    async function buscarMensagensPorId(cli, entidade, ids, ctx) {
+        const listaDeIds = ids.map((id) => new Api.InputMessageID({ id }));
+        const pedido =
+            entidade && entidade.className === "Channel"
+                ? new Api.channels.GetMessages({ channel: entidade, id: listaDeIds })
+                : new Api.messages.GetMessages({ id: listaDeIds });
+        const resposta = await chamarComPausaLocal(() => cli.invoke(pedido, undefined, { floodSleepThreshold: 0 }), ctx);
+        const porId = new Map();
+        for (const mensagem of (resposta && resposta.messages) || []) {
+            if (mensagem && mensagem.className !== "MessageEmpty") porId.set(mensagem.id, mensagem);
+        }
+        return porId;
+    }
+
+    // ---- 4. alvo da midia ----
+
+    const EXTENSAO_POR_MIME = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+        "image/gif": "gif",
+        "video/mp4": "mp4",
+        "video/quicktime": "mov",
+        "video/webm": "webm",
+        "audio/mpeg": "mp3",
+        "audio/ogg": "ogg",
+        "audio/mp4": "m4a",
+        "application/pdf": "pdf",
+        "application/zip": "zip",
+        "application/x-tgsticker": "tgs",
+    };
+
+    // Nome que o Windows, o Linux e a checagem de nome do proprio Chromium
+    // aceitam: sem caractere proibido, sem ponto/espaco no fim, sem nome
+    // reservado do Windows (CON, NUL, COM1...), sem extensao que o Chromium
+    // recusa (.lnk, .local), e cortado por BYTES (limite de 255 bytes por
+    // nome no Linux/macOS; nome em cirilico/chines tem 2-3 bytes por
+    // letra) mantendo a extensao. Folga pra " (999)" e ".part".
+    const LIMITE_BYTES_DO_NOME = 200;
+    function nomeSeguro(nome) {
+        let limpo = String(nome || "arquivo").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").replace(/[. ]+$/g, "");
+        if (!limpo) limpo = "arquivo";
+        const ponto = limpo.lastIndexOf(".");
+        let base = ponto > 0 ? limpo.slice(0, ponto) : limpo;
+        let extensao = ponto > 0 ? limpo.slice(ponto) : "";
+        if (/^\.(lnk|local)$/i.test(extensao)) extensao += "_";
+        if (/^(con|prn|aux|nul|com\d|lpt\d)$/i.test(base)) base = "_" + base;
+        const codificador = new TextEncoder();
+        if (codificador.encode(extensao).length > 20) extensao = "";
+        while (base.length > 1 && codificador.encode(base + extensao).length > LIMITE_BYTES_DO_NOME) {
+            base = base.slice(0, Math.max(1, Math.floor(base.length * 0.9)));
+        }
+        return (base.replace(/[. ]+$/g, "") || "arquivo") + extensao;
+    }
+
+    // Maior tamanho de uma foto: PhotoSize (size em bytes) ou
+    // PhotoSizeProgressive (o maior de sizes). Previa embutida
+    // (stripped/cached/path) nunca e a foto cheia.
+    function maiorTamanhoDaFoto(foto) {
+        let melhor = null;
+        let bytes = -1;
+        for (const tamanho of foto.sizes || []) {
+            let b = null;
+            if (tamanho.className === "PhotoSize") b = tamanho.size;
+            else if (tamanho.className === "PhotoSizeProgressive") b = Math.max(...(tamanho.sizes || [0]));
+            if (b != null && b > bytes) {
+                bytes = b;
+                melhor = tamanho;
+            }
+        }
+        return melhor ? { tipo: melhor.type, bytes } : null;
+    }
+
+    // De uma mensagem, o que baixar: local do arquivo no Telegram
+    // (location + DC), tamanho, nome e mime. Cobre documento (video,
+    // audio, arquivo), foto (no maior tamanho) e a midia da previa de link
+    // (media.webpage.document / .photo).
+    function alvoDaMensagem(mensagem, chatId) {
+        let media = mensagem && mensagem.media;
+        if (!media) throw erroComMensagem("essa mensagem nao tem foto, video, audio ou arquivo");
+        let daPrevia = false;
+        if (media.className === "MessageMediaWebPage") {
+            const pagina = media.webpage;
+            const doc = pagina && pagina.document;
+            const foto = pagina && pagina.photo;
+            if (!doc && !foto) throw erroComMensagem("a previa desse link nao tem foto nem arquivo pra baixar");
+            media = doc ? { className: "MessageMediaDocument", document: doc } : { className: "MessageMediaPhoto", photo: foto };
+            daPrevia = true;
+        }
+        if (media.className === "MessageMediaDocument" && media.document && media.document.className !== "DocumentEmpty") {
+            const doc = media.document;
+            let nome = null;
+            for (const atributo of doc.attributes || []) if (atributo.fileName) nome = atributo.fileName;
+            const mime = doc.mimeType || "application/octet-stream";
+            if (!nome) {
+                const extensao = EXTENSAO_POR_MIME[mime] || (mime.split("/")[1] || "bin").replace(/[^a-z0-9]/gi, "");
+                nome = "tlgr_" + chatId + "_" + mensagem.id + (daPrevia ? "_previa" : "") + "." + extensao;
+            }
+            return {
+                location: new Api.InputDocumentFileLocation({
+                    id: doc.id,
+                    accessHash: doc.accessHash,
+                    fileReference: doc.fileReference,
+                    thumbSize: "",
+                }),
+                dcId: doc.dcId,
+                tamanho: Number(doc.size),
+                tamanhoExato: true,
+                nome: nomeSeguro(nome),
+                mime,
+            };
+        }
+        if (media.className === "MessageMediaPhoto" && media.photo && media.photo.className !== "PhotoEmpty") {
+            const foto = media.photo;
+            const maior = maiorTamanhoDaFoto(foto);
+            if (!maior) throw erroComMensagem("essa foto nao tem nenhum tamanho baixavel");
+            return {
+                location: new Api.InputPhotoFileLocation({
+                    id: foto.id,
+                    accessHash: foto.accessHash,
+                    fileReference: foto.fileReference,
+                    thumbSize: maior.tipo,
+                }),
+                dcId: foto.dcId,
+                tamanho: maior.bytes,
+                tamanhoExato: false, // tamanho da foto vem da lista de tamanhos, nao do arquivo em si
+                nome: nomeSeguro("tlgr_" + chatId + "_" + mensagem.id + (daPrevia ? "_previa" : "") + ".jpg"),
+                mime: "image/jpeg",
+            };
+        }
+        throw erroComMensagem("essa mensagem nao tem foto, video, audio ou arquivo");
+    }
+
+    // ---- 5. gravadores ----
+    //
+    // Interface comum: { onde, escrever(dados), concluir(), descartar() }.
+
+    // Raiz da pasta de dados do painel (o mesmo handle salvo no IndexedDB
+    // de config), carregada sem pedir nada ao usuario quando a ferramenta
+    // esta ligada - assim o Alt+clique ja tem o handle na mao e so precisa
+    // de requestPermission (que exige o gesto do clique) se o navegador
+    // tiver revogado a permissao.
+    let pastaParaDownloads = null;
+    function carregarPastaParaDownloads() {
+        if (pastaParaDownloads || typeof indexedDB === "undefined" || !indexedDB) return;
+        lerPastaSalva()
+            .then((pasta) => {
+                if (pasta && !pastaParaDownloads) pastaParaDownloads = pasta;
+            })
+            .catch(() => {});
+    }
+
+    // Chamada no clique, ANTES de qualquer chamada de rede: o navegador so
+    // aceita requestPermission durante a "ativacao transitoria" do gesto
+    // (alguns segundos no Chrome), que acaba se a gente esperar a rede
+    // primeiro. Leitura do IndexedDB e local e rapida, nao estoura esse
+    // tempo. Devolve a pasta com permissao, ou null (cai no fallback em
+    // memoria).
+    async function pastaComPermissaoNoGesto() {
+        let pasta = pastaDeArmazenamento || pastaParaDownloads;
+        if (!pasta && typeof indexedDB !== "undefined" && indexedDB) pasta = await lerPastaSalva().catch(() => null);
+        if (!pasta || !pasta.queryPermission) return null;
+        let permissao = await pasta.queryPermission({ mode: "readwrite" }).catch(() => "denied");
+        let pediuAgora = false;
+        if (permissao !== "granted" && pasta.requestPermission) {
+            pediuAgora = true;
+            permissao = await pasta.requestPermission({ mode: "readwrite" }).catch(() => "denied");
+        }
+        if (permissao !== "granted") return null;
+        pastaParaDownloads = pasta;
+        // Pasta separada pros arquivos (opcional): tambem precisa do gesto.
+        // So pede se a de dados nao acabou de pedir (um pedido por clique).
+        await carregarPastaDeDownloadsSeparada();
+        if (pastaDeDownloadsSeparada && !pediuAgora) {
+            const atual = await pastaDeDownloadsSeparada.queryPermission({ mode: "readwrite" }).catch(() => "denied");
+            if (atual !== "granted" && pastaDeDownloadsSeparada.requestPermission) {
+                await pastaDeDownloadsSeparada.requestPermission({ mode: "readwrite" }).catch(() => "denied");
+            }
+        }
+        return pasta;
+    }
+
+    // ---- pasta separada pros arquivos baixados (rodada 4, opcional) ----
+    // Padrao: <pasta de dados>/Downloads_TLGR. Em Configuracoes > Downloads
+    // da pra escolher outra pasta so pros arquivos; o historico e o estado
+    // do lote continuam na pasta de dados. Sem permissao na hora (ex.:
+    // lote retomado sozinho ao abrir a aba, sem clique), o arquivo vai pra
+    // Downloads_TLGR da pasta de dados - e o aviso diz isso.
+    let pastaDeDownloadsSeparada = null;
+    let pastaDeDownloadsCarregada = false;
+    async function carregarPastaDeDownloadsSeparada() {
+        if (pastaDeDownloadsCarregada) return pastaDeDownloadsSeparada;
+        pastaDeDownloadsCarregada = true;
+        if (typeof indexedDB !== "undefined" && indexedDB) pastaDeDownloadsSeparada = await lerHandleSalvo("pastaDownloads").catch(() => null);
+        return pastaDeDownloadsSeparada;
+    }
+    async function escolherPastaDeDownloads() {
+        const handle = await window.showDirectoryPicker({ mode: "readwrite", id: "gestor-tlgr-downloads" });
+        await salvarHandle("pastaDownloads", handle);
+        pastaDeDownloadsSeparada = handle;
+        pastaDeDownloadsCarregada = true;
+        return handle;
+    }
+    async function voltarPastaDeDownloadsAoPadrao() {
+        await salvarHandle("pastaDownloads", null);
+        pastaDeDownloadsSeparada = null;
+        pastaDeDownloadsCarregada = true;
+    }
+    async function destinoDosDownloads(pastaRaiz) {
+        await carregarPastaDeDownloadsSeparada();
+        if (pastaDeDownloadsSeparada) {
+            const permissao = await pastaDeDownloadsSeparada.queryPermission({ mode: "readwrite" }).catch(() => "denied");
+            if (permissao === "granted") return { pasta: pastaDeDownloadsSeparada, prefixo: "", base: "downloads" };
+            const pasta = await pastaRaiz.getDirectoryHandle(PASTA_DOWNLOADS, { create: true });
+            return { pasta, prefixo: PASTA_DOWNLOADS + "/", base: "dados", aviso: "a pasta de downloads escolhida nao estava liberada" };
+        }
+        const pasta = await pastaRaiz.getDirectoryHandle(PASTA_DOWNLOADS, { create: true });
+        return { pasta, prefixo: PASTA_DOWNLOADS + "/", base: "dados" };
+    }
+
+    async function existeNaPasta(pasta, nome) {
+        try {
+            await pasta.getFileHandle(nome);
+            return true;
+        } catch (erro) {
+            return false;
+        }
+    }
+
+    // "video.mp4" -> "video (2).mp4" se ja existir (ou se tiver um .part
+    // dele de outro download em andamento).
+    // Nomes em uso por downloads EM ANDAMENTO (pasta/nome). Sem isso, dois
+    // downloads com o mesmo nome rodando ao mesmo tempo (comum no lote:
+    // IMG_0001.MP4, nome dado por bot) conferiam "o nome esta livre?" antes
+    // de qualquer um criar o .part, escolhiam o mesmo nome, gravavam no
+    // mesmo arquivo e um sumia em silencio (achado na revisao da rodada 3).
+    // A reserva entra sem nenhum await entre a ultima conferencia e o add.
+    const nomesReservados = new Set();
+
+    async function nomeLivreNaPasta(pasta, nomeDesejado, chaveDaPasta) {
+        const ponto = nomeDesejado.lastIndexOf(".");
+        const base = ponto > 0 ? nomeDesejado.slice(0, ponto) : nomeDesejado;
+        const extensao = ponto > 0 ? nomeDesejado.slice(ponto) : "";
+        for (let n = 1; n < 1000; n++) {
+            const nome = n === 1 ? nomeDesejado : base + " (" + n + ")" + extensao;
+            const chave = chaveDaPasta + "/" + nome;
+            if (nomesReservados.has(chave)) continue;
+            if (await existeNaPasta(pasta, nome)) continue;
+            if (await existeNaPasta(pasta, nome + ".part")) continue;
+            if (nomesReservados.has(chave)) continue; // outro download pegou durante as conferencias
+            nomesReservados.add(chave);
+            return { nome, liberar: () => nomesReservados.delete(chave) };
+        }
+        throw erroComMensagem("ja existem 999 arquivos com esse nome em " + PASTA_DOWNLOADS);
+    }
+
+    // Grava em pedacos num arquivo "<nome>.part" dentro de
+    // <pasta de dados>/Downloads_TLGR e so no fim renomeia pro nome final.
+    // Cancelou ou falhou: descarta a escrita e apaga o .part. O navegador
+    // ja grava num arquivo temporario proprio (.crswap) ate o close() - o
+    // .part e pra deixar claro, na pasta, o que ainda nao terminou.
+    async function criarGravadorNaPasta(pastaRaiz, nomeDesejado, subpasta) {
+        const destino = await destinoDosDownloads(pastaRaiz);
+        let pasta = destino.pasta;
+        if (subpasta) pasta = await pasta.getDirectoryHandle(subpasta, { create: true });
+        const chaveDaPasta = destino.base + ":" + destino.prefixo + (subpasta || "");
+        const reserva = await nomeLivreNaPasta(pasta, nomeDesejado, chaveDaPasta);
+        const nomeFinal = reserva.nome;
+        const nomeParcial = nomeFinal + ".part";
+        let handle;
+        let escrita;
+        try {
+            handle = await pasta.getFileHandle(nomeParcial, { create: true });
+            escrita = await handle.createWritable();
+        } catch (erro) {
+            reserva.liberar();
+            await pasta.removeEntry(nomeParcial).catch(() => {});
+            throw erro;
+        }
+        let fechado = false;
+        // Os pedacos sao copiados num UNICO bloco de 4 MB, reaproveitado, e
+        // o bloco e gravado quando enche. Medido no Chromium (HISTORICO,
+        // rodada 3): gravar cada pedaco de 512 KB direto deixava ~110 MB na
+        // aba (copias ja gravadas esperando o coletor de lixo); com o bloco,
+        // bem menos - e mais rapido. Seguro reaproveitar: write() so resolve
+        // depois que o navegador ja copiou os dados.
+        const bloco = new Uint8Array(BLOCO_DE_ESCRITA);
+        let usado = 0;
+        const relativo = destino.prefixo + (subpasta ? subpasta + "/" : "") + nomeFinal;
+        const gravador = {
+            onde: (destino.base === "downloads" ? "pasta de downloads escolhida: " : "") + relativo + (destino.aviso ? " (" + destino.aviso + ")" : ""),
+            nomeFinal,
+            relativo,
+            base: destino.base,
+            arquivoFinal: null,
+            async escrever(dados) {
+                let posicao = 0;
+                while (posicao < dados.length) {
+                    const quantos = Math.min(dados.length - posicao, bloco.length - usado);
+                    bloco.set(dados.subarray(posicao, posicao + quantos), usado);
+                    usado += quantos;
+                    posicao += quantos;
+                    if (usado === bloco.length) {
+                        await escrita.write(bloco);
+                        usado = 0;
+                    }
+                }
+            },
+            async concluir() {
+                if (usado > 0) await escrita.write(bloco.subarray(0, usado));
+                usado = 0;
+                await escrita.close();
+                fechado = true;
+                try {
+                    gravador.arquivoFinal = await renomearNaPasta(pasta, handle, nomeParcial, nomeFinal);
+                } catch (erro) {
+                    // O arquivo esta COMPLETO no .part - nao apaga (descartar()
+                    // nao mexe depois do close); so avisa onde ficou.
+                    throw erroComMensagem(
+                        "baixou inteiro, mas nao deu pra renomear: ficou como " +
+                            destino.prefixo + (subpasta ? subpasta + "/" : "") + nomeParcial +
+                            " (" + mensagemDoErro(erro) + ")"
+                    );
+                } finally {
+                    reserva.liberar();
+                }
+            },
+            async descartar() {
+                if (fechado) {
+                    reserva.liberar();
+                    return; // ja fechado = arquivo completo; nunca apaga
+                }
+                fechado = true;
+                await escrita.abort().catch(() => {});
+                await pasta.removeEntry(nomeParcial).catch(() => {});
+                reserva.liberar();
+            },
+        };
+        return gravador;
+    }
+
+    // move() existe em navegador Chromium recente; sem ele, copia em fluxo
+    // (pedaco por pedaco, memoria baixa) e apaga o .part.
+    async function renomearNaPasta(pasta, handle, nomeAtual, nomeNovo) {
+        if (typeof handle.move === "function") {
+            try {
+                await handle.move(nomeNovo);
+                return handle;
+            } catch (erro) {
+                // cai na copia abaixo
+            }
+        }
+        const arquivo = await handle.getFile();
+        const novo = await pasta.getFileHandle(nomeNovo, { create: true });
+        try {
+            const escrita = await novo.createWritable();
+            await arquivo.stream().pipeTo(escrita); // pipeTo fecha a escrita no fim
+        } catch (erro) {
+            await pasta.removeEntry(nomeNovo).catch(() => {}); // nao deixa copia pela metade
+            throw erro;
+        }
+        await pasta.removeEntry(nomeAtual);
+        return novo;
+    }
+
+    // Sem pasta: junta os pedacos (sem concatenar numa copia so) e entrega
+    // como download do navegador. So pra arquivo ate LIMITE_BYTES_SEM_PASTA.
+    function criarGravadorEmMemoria(nome, mime) {
+        let partes = [];
+        return {
+            onde: "pasta de Downloads do navegador (se ele perguntar sobre varios downloads, permita)",
+            nomeFinal: nome,
+            escrever(dados) {
+                partes.push(dados);
+            },
+            async concluir() {
+                const url = URL.createObjectURL(new Blob(partes, { type: mime }));
+                partes = [];
+                const link = document.createElement("a");
+                link.href = url;
+                link.download = nome;
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 60000); // revogar na hora pode cancelar o download em alguns navegadores
+            },
+            async descartar() {
+                partes = [];
+            },
+        };
+    }
+
+    // ---- 6. motor de download por pedacos ----
+    //
+    // obterPedaco(offset, limite) -> bytes. Pede ate "pedacosEmParalelo"
+    // pedacos ao mesmo tempo, mas nunca mais que "janela" pedacos a frente
+    // do que ja foi gravado (memoria limitada); grava SEMPRE na ordem.
+    // Tamanho conhecido: para no ultimo pedaco. Desconhecido: para no
+    // primeiro pedaco menor que o tamanho do pedaco.
+    async function baixarPorPedacos({
+        obterPedaco,
+        tamanho,
+        tamanhoExato,
+        gravador,
+        sinal,
+        aoAvancar,
+        tamanhoPedaco = TAMANHO_PEDACO,
+        pedacosEmParalelo = PEDACOS_EM_PARALELO,
+        janela = JANELA_DE_PEDACOS,
+    }) {
+        const totalDePedacos = tamanho > 0 ? Math.ceil(tamanho / tamanhoPedaco) : Infinity;
+        let proximoAPedir = 0;
+        let proximoAGravar = 0;
+        let ultimoPedaco = totalDePedacos - 1; // vira finito quando um pedaco curto aparece (tamanho desconhecido)
+        let erro = null;
+        let gravados = 0;
+        const prontos = new Map();
+        const esperando = [];
+        const acordar = () => {
+            while (esperando.length) esperando.shift()();
+        };
+        const aoCancelar = () => {
+            erro = erro || erroDeCancelado();
+            acordar();
+        };
+        if (sinal) {
+            if (sinal.aborted) throw erroDeCancelado();
+            sinal.addEventListener("abort", aoCancelar, { once: true });
+        }
+
+        let gravacao = Promise.resolve();
+        const drenar = () => {
+            gravacao = gravacao
+                .then(async () => {
+                    while (!erro && prontos.has(proximoAGravar)) {
+                        const dados = prontos.get(proximoAGravar);
+                        prontos.delete(proximoAGravar);
+                        if (dados.length) await gravador.escrever(dados);
+                        gravados += dados.length;
+                        proximoAGravar++;
+                        acordar();
+                        if (aoAvancar) aoAvancar(gravados);
+                    }
+                })
+                .catch((e) => {
+                    erro = erro || e;
+                    acordar();
+                });
+        };
+
+        const trabalhador = async () => {
+            while (!erro) {
+                if (proximoAPedir > ultimoPedaco) return;
+                if (proximoAPedir >= proximoAGravar + janela) {
+                    await new Promise((resolve) => esperando.push(resolve));
+                    continue;
+                }
+                const indice = proximoAPedir++;
+                let dados;
+                try {
+                    dados = await obterPedaco(indice * tamanhoPedaco, tamanhoPedaco);
+                } catch (e) {
+                    erro = erro || e;
+                    acordar();
+                    return;
+                }
+                if (erro) return;
+                if (dados.length < tamanhoPedaco && indice < ultimoPedaco) ultimoPedaco = indice;
+                prontos.set(indice, dados);
+                drenar();
+            }
+        };
+
+        try {
+            await Promise.all(Array.from({ length: pedacosEmParalelo }, trabalhador));
+            await gravacao;
+        } finally {
+            if (sinal) sinal.removeEventListener("abort", aoCancelar);
+        }
+        if (erro) throw erro;
+        if (tamanhoExato && tamanho > 0 && gravados !== tamanho) {
+            throw erroComMensagem("arquivo veio incompleto (" + gravados + " de " + tamanho + " bytes)");
+        }
+        return gravados;
+    }
+
+    // Um pedaco do arquivo no Telegram, pelo agendador de midia do proprio
+    // teleproto (cli._media.getFile): ele escolhe a conexao, abre conexao
+    // extra no DC do arquivo e segue FILE_MIGRATE sozinho. Por cima disso,
+    // aqui: pausa de flood que ele devolver (espera com contagem e tenta o
+    // mesmo pedaco de novo) e FILE_REFERENCE_EXPIRED (pede a mensagem de
+    // novo pra ter uma referencia fresca e tenta de novo).
+    // cli._media e interno do fork (teleproto 1.229.1, versao travada no
+    // package.json) - ver HISTORICO_TECNICO.md, rodada 3.
+    function criarObterPedaco(cli, alvo, ctx) {
+        return async (offset, limite) => {
+            let pausasDePremium = 0;
+            for (let tentativa = 0; ; tentativa++) {
+                if (ctx.sinal && ctx.sinal.aborted) throw erroDeCancelado();
+                const versaoDaReferencia = alvo.versaoDaReferencia || 0;
+                try {
+                    return await cli._media.getFile(alvo.dcId, alvo.location, offset, limite, ctx.sinal, (dc) => {
+                        alvo.dcId = dc;
+                    });
+                } catch (erro) {
+                    if (ctx.sinal && ctx.sinal.aborted) throw erroDeCancelado();
+                    const segundos = segundosDeFlood(erro);
+                    if (segundos && ehLimiteDePremium(erro) && pausasDePremium++ < MAXIMO_DE_PAUSAS_DE_PREMIUM) {
+                        tentativa--; // limite de velocidade nao conta como tentativa
+                        await esperarComContagem(segundos, ctx, true);
+                        continue;
+                    }
+                    if (segundos && tentativa < MAXIMO_DE_PAUSAS) {
+                        await esperarComContagem(segundos, ctx);
+                        continue;
+                    }
+                    if (/FILE_REFERENCE_(EXPIRED|INVALID)/.test(erro && erro.errorMessage) && alvo.renovar && tentativa < 3) {
+                        // Uma renovacao so pra todos os pedacos que deram o mesmo
+                        // erro ao mesmo tempo (senao seriam ate 32 pedidos da
+                        // mesma mensagem - convite a flood).
+                        // Pedido feito com a referencia antiga mas que so falhou
+                        // depois de outra renovacao: so tenta de novo.
+                        if ((alvo.versaoDaReferencia || 0) !== versaoDaReferencia) continue;
+                        if (!alvo.renovando) {
+                            alvo.renovando = alvo
+                                .renovar()
+                                .then(() => {
+                                    alvo.versaoDaReferencia = (alvo.versaoDaReferencia || 0) + 1;
+                                })
+                                .finally(() => {
+                                    alvo.renovando = null;
+                                });
+                        }
+                        await alvo.renovando;
+                        continue;
+                    }
+                    throw erro;
+                }
+            }
+        };
+    }
+
+    // Pausa que o agendador do teleproto esta cumprindo sozinho (ele espera
+    // floods curtos sem devolver erro). So leitura, pra mostrar a contagem
+    // no aviso em vez de parecer travado.
+    function segundosDePausaDoAgendador(cli, dcId) {
+        try {
+            const balanco = cli._media && cli._media._balances && cli._media._balances.get(dcId + ":download");
+            const restante = balanco ? balanco.floodWaitUntil - Date.now() : 0;
+            return restante > 0 ? Math.ceil(restante / 1000) : 0;
+        } catch (erro) {
+            return 0;
+        }
+    }
+
+    // Download completo de uma mensagem ja buscada: escolhe o gravador,
+    // baixa, conclui; em qualquer falha (ou cancelamento) descarta o .part.
+    async function baixarMidiaParaDestino(cli, mensagem, chatId, entidade, pasta, ctx, subpasta) {
+        const alvo = alvoDaMensagem(mensagem, chatId);
+        alvo.renovar = async () => {
+            const nova = (await buscarMensagensPorId(cli, entidade, [mensagem.id], ctx)).get(mensagem.id);
+            if (!nova) throw erroComMensagem("a mensagem sumiu enquanto baixava");
+            alvo.location = alvoDaMensagem(nova, chatId).location;
+        };
+        ctx.aoNome(alvo.nome, alvo.tamanho);
+        let gravador;
+        if (pasta) {
+            gravador = await criarGravadorNaPasta(pasta, alvo.nome, subpasta);
+        } else if (alvo.tamanho > LIMITE_BYTES_SEM_PASTA) {
+            throw erroComMensagem(
+                "arquivo de " +
+                    Math.round(alvo.tamanho / 1048576) +
+                    " MB e grande demais pra baixar sem a pasta de dados (limite " +
+                    Math.round(LIMITE_BYTES_SEM_PASTA / 1048576) +
+                    " MB). Abra o painel (botao Gestor TLGR), confirme o acesso a pasta e tente de novo"
+            );
+        } else {
+            gravador = criarGravadorEmMemoria(alvo.nome, alvo.mime);
+        }
+        ctx.dcAtual = () => alvo.dcId;
+        try {
+            const bytes = await baixarPorPedacos({
+                obterPedaco: criarObterPedaco(cli, alvo, ctx),
+                tamanho: alvo.tamanho,
+                tamanhoExato: alvo.tamanhoExato,
+                gravador,
+                sinal: ctx.sinal,
+                aoAvancar: ctx.aoProgresso,
+            });
+            await gravador.concluir();
+            const resultado = {
+                onde: gravador.onde,
+                nome: gravador.nomeFinal,
+                bytes,
+                relativo: gravador.relativo || null,
+                base: gravador.base || null,
+                arquivo: gravador.arquivoFinal || null,
+                chatId,
+                messageId: mensagem.id,
+                chatTitle: (entidade && (entidade.title || nomeDaEntidade(entidade))) || chatId,
+            };
+            if (pasta && resultado.relativo) await registrarNoHistoricoDeDownloads(pasta, resultado).catch((erro) => console.warn("[Gestor TLGR] historico de downloads:", erro));
+            return resultado;
+        } catch (erro) {
+            await gravador.descartar().catch(() => {});
+            throw erro;
+        }
+    }
+
+    // ---- trava do servidor (entre abas e entre ferramentas) ----
+    //
+    // So um trabalho pesado no servidor por vez - download em lote ou
+    // verificacao dos Monitorados - em todas as abas do Telegram Web
+    // abertas. Fica no armazenamento do Tampermonkey (mesma chave que o
+    // lote usava, "trp_lote_trava"): { aba, dono, ate }. Quem roda renova a
+    // cada VALIDADE/3; aba que fechou sem avisar perde a trava sozinha
+    // quando "ate" vence. Na MESMA aba, dono diferente tambem espera (antes
+    // so contava a aba).
+    const CHAVE_TRAVA_DO_SERVIDOR = "trp_lote_trava";
+    const VALIDADE_TRAVA_DO_SERVIDOR_MS = 30000;
+    const idDestaAba = Math.random().toString(36).slice(2);
+    const NOMES_DOS_DONOS_DA_TRAVA = { lote: "download em lote", monitorados: "verificacao dos Monitorados" };
+
+    function lerTravaDoServidor() {
+        try {
+            return JSON.parse(GM_getValue(CHAVE_TRAVA_DO_SERVIDOR, "null"));
+        } catch (erro) {
+            return null;
+        }
+    }
+    function pegarTravaDoServidor(dono) {
+        const trava = lerTravaDoServidor();
+        if (trava && trava.ate > Date.now() && (trava.aba !== idDestaAba || (trava.dono || "lote") !== dono)) return false;
+        GM_setValue(CHAVE_TRAVA_DO_SERVIDOR, JSON.stringify({ aba: idDestaAba, dono, ate: Date.now() + VALIDADE_TRAVA_DO_SERVIDOR_MS }));
+        return true;
+    }
+    function soltarTravaDoServidor(dono) {
+        const trava = lerTravaDoServidor();
+        if (trava && trava.aba === idDestaAba && (!dono || (trava.dono || "lote") === dono)) GM_setValue(CHAVE_TRAVA_DO_SERVIDOR, "null");
+    }
+    function descricaoDaTravaDoServidor() {
+        const trava = lerTravaDoServidor();
+        if (!trava || trava.ate <= Date.now()) return "nada";
+        return (NOMES_DOS_DONOS_DA_TRAVA[trava.dono || "lote"] || trava.dono) + (trava.aba === idDestaAba ? " nesta aba" : " em outra aba");
+    }
+
+    // ---- 7. fila + central de downloads ----
+
+    const filaDeDownloads = [];
+    let downloadsAtivos = 0;
+    let contadorDeDownloads = 0;
+
+    // tarefa: { rotulo, executar(ctx) -> {onde, nome, bytes} }. ctx traz
+    // sinal (cancelamento), aoNome, aoProgresso, aoPausa. Devolve o item
+    // (com .promessa e .cancelar()).
+    function enfileirarDownload(tarefa) {
+        const controle = new AbortController();
+        const item = {
+            id: ++contadorDeDownloads,
+            rotulo: tarefa.rotulo,
+            nome: tarefa.rotulo,
+            estado: "fila",
+            total: 0,
+            gravados: 0,
+            pausa: 0,
+            inicio: 0,
+            resultado: null,
+            erro: null,
+            controle,
+            cancelar() {
+                if (item.estado === "fila") {
+                    item.estado = "cancelado";
+                    item.erro = erroDeCancelado();
+                    resolverItem();
+                    atualizarCentral();
+                    setTimeout(() => removerItemDaCentral(item), 15000);
+                    return;
+                }
+                controle.abort();
+            },
+        };
+        let resolverItem;
+        item.promessa = new Promise((resolve) => {
+            resolverItem = () => resolve(item);
+        });
+        item.tarefa = tarefa;
+        item.resolver = () => resolverItem();
+        filaDeDownloads.push(item);
+        atualizarCentral();
+        processarFila();
+        return item;
+    }
+
+    function processarFila() {
+        while (downloadsAtivos < lerPreferencia("dl_simultaneos")) {
+            const proximo = filaDeDownloads.find((item) => item.estado === "fila");
+            if (!proximo) return;
+            iniciarItem(proximo);
+        }
+    }
+
+    async function iniciarItem(item) {
+        downloadsAtivos++;
+        ligarRelogioDaCentral();
+        item.estado = "baixando";
+        item.inicio = Date.now();
+        const ctx = {
+            sinal: item.controle.signal,
+            aoNome(nome, total) {
+                item.nome = nome;
+                item.total = total || 0;
+                atualizarCentral();
+            },
+            aoProgresso(gravados) {
+                item.gravados = gravados;
+                atualizarCentralSemPressa();
+            },
+            aoPausa(segundos, premium) {
+                item.pausa = segundos;
+                if (premium) item.limitePremium = true;
+                atualizarCentral();
+            },
+            dcAtual: () => null,
+        };
+        item.ctx = ctx;
+        try {
+            item.resultado = await item.tarefa.executar(ctx);
+            item.estado = "ok";
+        } catch (erro) {
+            item.erro = erro;
+            item.estado = erro && erro.cancelado ? "cancelado" : "erro";
+            if (!(erro && erro.cancelado)) console.warn("[Gestor TLGR] download:", erro);
+        } finally {
+            downloadsAtivos--;
+            item.pausa = 0;
+            item.fim = Date.now();
+            atualizarCentral();
+            item.resolver();
+            processarFila();
+            // Concluido fica 60 s (da tempo de clicar Abrir arquivo / Copiar
+            // caminho; o botao Fechar tira antes). Erro/cancelado: 15 s.
+            setTimeout(() => removerItemDaCentral(item), item.estado === "ok" && !(item.resultado && item.resultado.soEnfileirou) ? 60000 : 15000);
+        }
+    }
+
+    function resumoDaFila() {
+        const baixando = filaDeDownloads.filter((i) => i.estado === "baixando").length;
+        const naFila = filaDeDownloads.filter((i) => i.estado === "fila").length;
+        return { baixando, naFila };
+    }
+
+    function formatarBytes(bytes) {
+        if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(2) + " GB";
+        if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + " MB";
+        return Math.max(1, Math.round(bytes / 1024)) + " KB";
+    }
+
+    function formatarTempo(segundosBrutos) {
+        if (!isFinite(segundosBrutos) || segundosBrutos < 0) return "?";
+        const segundos = Math.ceil(segundosBrutos); // arredonda UMA vez (antes dava "1min60s")
+        if (segundos < 60) return segundos + "s";
+        const minutos = Math.floor(segundos / 60);
+        if (minutos < 60) return minutos + "min" + String(segundos % 60).padStart(2, "0") + "s";
+        return Math.floor(minutos / 60) + "h" + String(minutos % 60).padStart(2, "0") + "min";
+    }
+
+    // Texto de uma linha da central: nome, %, MB/s, tempo restante (ou a
+    // pausa pedida pelo Telegram).
+    function textoDoItem(item) {
+        if (item.estado === "fila") return item.nome + " - na fila";
+        if (item.estado === "ok" && item.resultado && item.resultado.soEnfileirou) return item.nome;
+        if (item.estado === "ok") return item.nome + " - salvo em " + (item.resultado ? item.resultado.onde : "?") + " (" + formatarBytes(item.gravados || (item.resultado && item.resultado.bytes) || 0) + ")";
+        if (item.estado === "cancelado") return item.nome + " - cancelado";
+        if (item.estado === "erro") return item.nome + " - nao deu pra baixar: " + mensagemDoErro(item.erro);
+        const pausaDoAgendador = cliente && item.ctx ? segundosDePausaDoAgendador(cliente, item.ctx.dcAtual()) : 0;
+        const pausa = Math.max(item.pausa || 0, pausaDoAgendador);
+        const segundos = Math.max(0.001, (Date.now() - item.inicio) / 1000);
+        const velocidade = item.gravados / segundos;
+        let texto = item.nome;
+        if (item.total > 0) texto += " - " + Math.min(100, Math.floor((item.gravados / item.total) * 100)) + "%";
+        else texto += " - " + formatarBytes(item.gravados);
+        if (item.gravados > 0) texto += " - " + (velocidade / 1048576).toFixed(1) + " MB/s";
+        if (pausa > 0 && item.limitePremium) texto += " - " + TEXTO_LIMITE_PREMIUM + " (pausa " + pausa + "s)";
+        else if (pausa > 0) texto += " - Telegram pediu pausa: " + pausa + "s";
+        else if (item.total > 0 && velocidade > 0) texto += " - falta " + formatarTempo((item.total - item.gravados) / velocidade);
+        if (item.limitePremium && !(pausa > 0)) texto += " - velocidade limitada pelo Telegram (conta sem Premium)";
+        return texto;
+    }
+
+    let centralDeDownloads = null; // { caixa, cabecalho, lista, linhas: Map(item.id -> {linha, texto, botao}) }
+    let ultimaAtualizacaoDaCentral = 0;
+    let atualizacaoAgendada = null;
+
+    function garantirCentral() {
+        if (centralDeDownloads) return centralDeDownloads;
+        const caixa = document.createElement("div");
+        Object.assign(caixa.style, {
+            position: "fixed",
+            left: "24px",
+            bottom: "24px",
+            zIndex: 999999,
+            width: "380px",
+            maxHeight: "50vh",
+            overflowY: "auto",
+            padding: "8px 12px",
+            borderRadius: "8px",
+            background: "#1c1f26",
+            color: "#e6e8ec",
+            fontFamily: "sans-serif",
+            fontSize: "12px",
+            boxShadow: "0 2px 10px rgba(0,0,0,0.35)",
+        });
+        const cabecalho = document.createElement("div");
+        cabecalho.style.cssText = "font-weight:600;margin-bottom:4px;";
+        const lista = document.createElement("div");
+        caixa.appendChild(cabecalho);
+        caixa.appendChild(lista);
+        document.body.appendChild(caixa);
+        centralDeDownloads = { caixa, cabecalho, lista, linhas: new Map() };
+        return centralDeDownloads;
+    }
+
+    function removerItemDaCentral(item) {
+        const indice = filaDeDownloads.indexOf(item);
+        if (indice >= 0) filaDeDownloads.splice(indice, 1);
+        atualizarCentral();
+    }
+
+    // Progresso chega a cada pedaco gravado (varias vezes por segundo) -
+    // redesenha no maximo 2x por segundo.
+    function atualizarCentralSemPressa() {
+        const agora = Date.now();
+        if (agora - ultimaAtualizacaoDaCentral >= 500) {
+            atualizarCentral();
+            return;
+        }
+        if (!atualizacaoAgendada) {
+            atualizacaoAgendada = setTimeout(() => {
+                atualizacaoAgendada = null;
+                atualizarCentral();
+            }, 500);
+        }
+    }
+
+    function atualizarCentral() {
+        ultimaAtualizacaoDaCentral = Date.now();
+        if (!filaDeDownloads.length) {
+            if (centralDeDownloads) {
+                for (const linha of centralDeDownloads.linhas.values()) if (linha.revogar) linha.revogar();
+                centralDeDownloads.caixa.remove();
+                centralDeDownloads = null;
+            }
+            return;
+        }
+        const central = garantirCentral();
+        const { baixando, naFila } = resumoDaFila();
+        central.cabecalho.textContent =
+            "Gestor TLGR - downloads: " + baixando + " baixando" + (naFila ? ", " + naFila + " na fila" : "");
+        const vistos = new Set();
+        for (const item of filaDeDownloads) {
+            vistos.add(item.id);
+            let linha = central.linhas.get(item.id);
+            if (!linha) {
+                const elemento = document.createElement("div");
+                elemento.style.cssText = "display:flex;gap:8px;align-items:flex-start;padding:4px 0;border-top:1px solid #2a2f3a;";
+                const miolo = document.createElement("div");
+                miolo.style.cssText = "flex:1;min-width:0;";
+                const texto = document.createElement("div");
+                texto.style.cssText = "overflow-wrap:anywhere;";
+                const acoes = document.createElement("div");
+                acoes.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-top:3px;";
+                miolo.appendChild(texto);
+                miolo.appendChild(acoes);
+                const botao = document.createElement("button");
+                botao.textContent = "Cancelar";
+                botao.style.cssText =
+                    "background:none;border:1px solid #3a2f2f;border-radius:4px;color:#ff6b6b;cursor:pointer;font-size:11px;padding:1px 6px;flex-shrink:0;";
+                botao.addEventListener("click", () => {
+                    if (item.estado === "fila" || item.estado === "baixando") item.cancelar();
+                    else removerItemDaCentral(item);
+                });
+                elemento.appendChild(miolo);
+                elemento.appendChild(botao);
+                central.lista.appendChild(elemento);
+                linha = { elemento, texto, acoes, botao, comAcoes: false };
+                central.linhas.set(item.id, linha);
+            }
+            linha.texto.textContent = textoDoItem(item);
+            linha.texto.style.color = item.estado === "erro" ? "#ff6b6b" : item.estado === "ok" ? "#5ec26a" : "#e6e8ec";
+            const emAndamento = item.estado === "fila" || item.estado === "baixando";
+            linha.botao.textContent = emAndamento ? "Cancelar" : "Fechar";
+            linha.botao.style.color = emAndamento ? "#ff6b6b" : "#8b92a3";
+            if (!linha.comAcoes && item.estado === "ok" && item.resultado && item.resultado.relativo) {
+                linha.comAcoes = true;
+                linha.revogar = montarAcoesDoArquivo(linha.acoes, item.resultado);
+            }
+        }
+        for (const [id, linha] of central.linhas) {
+            if (!vistos.has(id)) {
+                if (linha.revogar) linha.revogar();
+                linha.elemento.remove();
+                central.linhas.delete(id);
+            }
+        }
+    }
+
+    // Enquanto tiver download rodando, redesenha 1x por segundo (tempo
+    // restante e contagem de pausa mudam mesmo sem pedaco novo chegando).
+    // O timer so existe enquanto houver download ativo.
+    let relogioDaCentral = null;
+    function ligarRelogioDaCentral() {
+        if (relogioDaCentral) return;
+        relogioDaCentral = setInterval(() => {
+            if (downloadsAtivos > 0) {
+                atualizarCentral();
+                return;
+            }
+            clearInterval(relogioDaCentral);
+            relogioDaCentral = null;
+        }, 1000);
+    }
+
+    // ---- 7b. levar ate o arquivo: historico, Abrir arquivo, Copiar caminho (rodada 4) ----
+    //
+    // Historico em <pasta de dados>/Downloads_TLGR/historico_downloads.jsonl
+    // (uma linha por arquivo concluido: onde ficou, de qual mensagem). A
+    // tela Downloads le daqui; o aviso de concluido usa o handle que o
+    // gravador acabou de criar.
+
+    const CAMINHO_HISTORICO_DOWNLOADS = PASTA_DOWNLOADS + "/historico_downloads.jsonl";
+    const urlsParaLiberarNoFim = [];
+    const MAXIMO_LINHAS_HISTORICO = 2000;
+
+    function registrarNoHistoricoDeDownloads(pastaRaiz, resultado) {
+        const linha = {
+            em: new Date().toISOString(),
+            nome: resultado.nome,
+            relativo: resultado.relativo,
+            base: resultado.base,
+            bytes: resultado.bytes,
+            chatId: resultado.chatId,
+            messageId: resultado.messageId,
+            chatTitle: resultado.chatTitle,
+        };
+        return anexarArquivoTexto(pastaRaiz, CAMINHO_HISTORICO_DOWNLOADS, JSON.stringify(linha) + "\n");
+    }
+
+    // Mais recente primeiro. Passou de MAXIMO_LINHAS_HISTORICO, regrava so
+    // a metade mais nova (o arquivo nao cresce pra sempre).
+    // Ler e encurtar acontecem DENTRO da fila de escrita do arquivo: um
+    // download concluido no meio (anexo na fila) nao se perde na regravacao
+    // (achado na revisao da rodada 4).
+    async function lerHistoricoDeDownloads(pastaRaiz, limite) {
+        let texto = "";
+        await enfileirarEscrita(CAMINHO_HISTORICO_DOWNLOADS, async () => {
+            texto = (await lerArquivoTexto(pastaRaiz, CAMINHO_HISTORICO_DOWNLOADS).catch(() => null)) || "";
+            const todas = texto.split("\n").filter(Boolean);
+            if (todas.length > MAXIMO_LINHAS_HISTORICO) {
+                texto = todas.slice(-MAXIMO_LINHAS_HISTORICO / 2).join("\n") + "\n";
+                const handle = await obterHandleArquivo(pastaRaiz, CAMINHO_HISTORICO_DOWNLOADS, true);
+                const escrita = await handle.createWritable();
+                await escrita.write(texto);
+                await escrita.close();
+            }
+        }).catch(() => {});
+        const linhas = texto.split("\n").filter(Boolean);
+        const registros = [];
+        for (let i = linhas.length - 1; i >= 0 && registros.length < (limite || 100); i--) {
+            try {
+                registros.push(JSON.parse(linhas[i]));
+            } catch (erro) {
+                // linha cortada: ignora
+            }
+        }
+        return registros;
+    }
+
+    // So abre no navegador o que e seguro mostrar numa aba: foto, video,
+    // audio, PDF e texto. HTML/SVG/etc. abertos como pagina rodariam
+    // script com acesso a aba do Telegram - esses ficam so com "Copiar
+    // caminho" (abrir pelo Explorer).
+    const TIPOS_SEGUROS_PARA_ABRIR = {
+        jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp",
+        mp4: "video/mp4", m4v: "video/mp4", mov: "video/mp4", webm: "video/webm", mkv: "video/webm",
+        mp3: "audio/mpeg", m4a: "audio/mp4", ogg: "audio/ogg", oga: "audio/ogg", opus: "audio/ogg", wav: "audio/wav", flac: "audio/flac",
+        pdf: "application/pdf", txt: "text/plain",
+    };
+    function tipoSeguroParaAbrir(nome) {
+        const extensao = (String(nome || "").split(".").pop() || "").toLowerCase();
+        return TIPOS_SEGUROS_PARA_ABRIR[extensao] || null;
+    }
+
+    // Handle do arquivo a partir do historico (sem o handle em memoria).
+    async function arquivoDoHistorico(registro) {
+        let pasta;
+        if (registro.base === "downloads") {
+            await carregarPastaDeDownloadsSeparada();
+            pasta = pastaDeDownloadsSeparada;
+            if (!pasta) throw erroComMensagem("a pasta de downloads separada nao esta mais configurada");
+        } else {
+            pasta = pastaDeArmazenamento || pastaParaDownloads;
+            if (!pasta) throw erroComMensagem("pasta de dados nao liberada");
+        }
+        const partes = String(registro.relativo).split("/");
+        for (let i = 0; i < partes.length - 1; i++) pasta = await pasta.getDirectoryHandle(partes[i]);
+        return pasta.getFileHandle(partes[partes.length - 1]);
+    }
+
+    // URL "blob:" do arquivo no disco, pra abrir numa aba com um link
+    // comum (sem window.open). O Blob aponta pro arquivo, nao copia ele pra
+    // memoria - medido no Chromium com 1 GB: +1 MB ao criar a URL; a aba
+    // aberta com o video, +110 MB (o tocador de video), HISTORICO rodada 4.
+    async function urlParaAbrirArquivo(info) {
+        const tipo = tipoSeguroParaAbrir(info.nome);
+        if (!tipo) throw erroComMensagem("tipo de arquivo que nao abre no navegador");
+        const handle = info.arquivo || (await arquivoDoHistorico(info));
+        const arquivo = await handle.getFile();
+        return URL.createObjectURL(new Blob([arquivo], { type: tipo }));
+    }
+
+    // O navegador nao conta o caminho de verdade no Windows: o usuario
+    // informa uma vez a pasta (Configuracoes > Downloads) e aqui junta com
+    // o caminho dentro dela.
+    function caminhoNoWindows(info) {
+        const base = info.base === "downloads" ? lerPreferencia("dl_caminho_downloads") : lerPreferencia("dl_caminho_base");
+        const dentro = String(info.relativo || info.nome || "").split("/").join("\\");
+        if (!base) return dentro;
+        return base.replace(/[\\/]+$/, "") + "\\" + dentro;
+    }
+
+    // Copia pro Ctrl+V. navigator.clipboard so funciona no clique; sem ele,
+    // o jeito antigo (textarea + execCommand).
+    async function copiarTexto(texto) {
+        try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(texto);
+                return true;
+            }
+        } catch (erro) {
+            // tenta o jeito antigo
+        }
+        try {
+            const area = document.createElement("textarea");
+            area.value = texto;
+            area.style.cssText = "position:fixed;left:-9999px;top:0;";
+            document.body.appendChild(area);
+            area.select();
+            const ok = document.execCommand("copy");
+            area.remove();
+            return !!ok;
+        } catch (erro) {
+            return false;
+        }
+    }
+
+    // "Abrir arquivo" (link comum com a URL ja pronta - o clique abre a
+    // aba direto, sem esperar nada) e "Copiar caminho". Devolve uma funcao
+    // que libera a URL.
+    function montarAcoesDoArquivo(container, info) {
+        const estilo = "background:#2a2f3a;border:none;border-radius:4px;color:#e6e8ec;cursor:pointer;font-size:11px;padding:2px 8px;text-decoration:none;";
+        let url = null;
+        let clicado = false;
+        if (tipoSeguroParaAbrir(info.nome)) {
+            const link = document.createElement("a");
+            // Aba aberta (video) continua lendo pela URL - URL clicada so e
+            // liberada quando a pagina do Telegram fecha.
+            link.addEventListener("click", () => (clicado = true));
+            link.textContent = "Abrir arquivo";
+            link.target = "_blank";
+            link.style.cssText = estilo + "opacity:0.5;";
+            link.title = "Abre numa aba nova (foto, video, audio, PDF)";
+            container.appendChild(link);
+            urlParaAbrirArquivo(info)
+                .then((pronta) => {
+                    url = pronta;
+                    link.href = pronta;
+                    link.style.opacity = "1";
+                })
+                .catch((erro) => {
+                    link.textContent = "nao da pra abrir: " + mensagemDoErro(erro);
+                    link.style.cursor = "default";
+                });
+        } else {
+            const aviso = document.createElement("span");
+            aviso.style.cssText = "color:#8b92a3;font-size:11px;";
+            aviso.textContent = "(esse tipo abre pelo Explorer)";
+            container.appendChild(aviso);
+        }
+        const botao = document.createElement("button");
+        botao.textContent = "Copiar caminho";
+        botao.style.cssText = estilo;
+        botao.title = caminhoNoWindows(info);
+        botao.addEventListener("click", async () => {
+            const caminho = caminhoNoWindows(info);
+            const ok = await copiarTexto(caminho);
+            botao.textContent = ok ? "Copiado!" : "Copie: " + caminho;
+            if (ok) setTimeout(() => (botao.textContent = "Copiar caminho"), 2000);
+        });
+        container.appendChild(botao);
+        const revogar = () => {
+            if (url && clicado) urlsParaLiberarNoFim.push(url);
+            else if (url) URL.revokeObjectURL(url);
+            url = null;
+        };
+        return revogar;
+    }
+
+    // Tela "Downloads": o que esta baixando agora (com Cancelar) e os
+    // ultimos arquivos concluidos (com Abrir e Copiar caminho).
+    let revogacoesDaTelaDownloads = [];
+    async function telaDownloads() {
+        for (const revogar of revogacoesDaTelaDownloads) revogar();
+        revogacoesDaTelaDownloads = [];
+        definirTituloTela("Downloads");
+        const corpo = corpoDoPainel();
+        botaoVoltar(corpo);
+        const pasta = pastaDeArmazenamento;
+        const tituloAgora = document.createElement("div");
+        tituloAgora.style.cssText = "color:#8b92a3;font-weight:600;margin-bottom:6px;";
+        tituloAgora.textContent = "Baixando agora";
+        corpo.appendChild(tituloAgora);
+        const agora = document.createElement("div");
+        agora.style.cssText = "font-size:12px;margin-bottom:12px;";
+        corpo.appendChild(agora);
+        const desenharAgora = () => {
+            agora.innerHTML = "";
+            const ativos = filaDeDownloads.filter((i) => i.estado === "fila" || i.estado === "baixando");
+            if (!ativos.length) {
+                agora.textContent = "Nada baixando. Alt+clique numa foto/video do Telegram (com a ferramenta ligada) ou use o Download em lote.";
+                agora.style.color = "#8b92a3";
+                return;
+            }
+            agora.style.color = "";
+            for (const item of ativos) {
+                const linha = document.createElement("div");
+                linha.style.cssText = "display:flex;gap:6px;align-items:center;padding:4px 0;border-bottom:1px solid #2a2f3a;";
+                const texto = document.createElement("span");
+                texto.style.cssText = "flex:1;min-width:0;";
+                texto.textContent = textoDoItem(item);
+                linha.appendChild(texto);
+                const cancelar = document.createElement("button");
+                cancelar.textContent = "Cancelar";
+                cancelar.style.cssText = "background:none;border:1px solid #3a2f2f;border-radius:4px;color:#ff6b6b;cursor:pointer;font-size:11px;padding:1px 6px;";
+                cancelar.addEventListener("click", () => item.cancelar());
+                linha.appendChild(cancelar);
+                agora.appendChild(linha);
+            }
+        };
+        desenharAgora();
+        const relogio = setInterval(() => {
+            if (agora.isConnected === false) {
+                clearInterval(relogio);
+                return;
+            }
+            desenharAgora();
+        }, 1000);
+
+        const tituloHistorico = document.createElement("div");
+        tituloHistorico.style.cssText = "color:#8b92a3;font-weight:600;margin-bottom:6px;display:flex;align-items:center;gap:4px;";
+        tituloHistorico.innerHTML =
+            "<span>Ultimos arquivos baixados</span>" +
+            criarIconeInfoHtml(
+                'Copiar caminho monta o caminho completo no Windows a partir da pasta informada em Configuracoes > Downloads (o navegador nao revela o caminho real). Abrir arquivo abre foto, video, audio e PDF numa aba nova; outros tipos, pelo Explorer.'
+            );
+        corpo.appendChild(tituloHistorico);
+        const historico = document.createElement("div");
+        historico.style.cssText = "font-size:12px;";
+        corpo.appendChild(historico);
+        if (!pasta) {
+            historico.textContent = "Pasta de dados nao liberada.";
+            return;
+        }
+        const registros = await lerHistoricoDeDownloads(pasta, 100);
+        if (!registros.length) {
+            historico.textContent = "Nenhum arquivo baixado ainda (o historico comecou na versao 2026.10.14.3).";
+            historico.style.color = "#8b92a3";
+            return;
+        }
+        for (const [i, registro] of registros.entries()) {
+            const linha = document.createElement("div");
+            linha.style.cssText = "padding:6px 0;border-bottom:1px solid #2a2f3a;";
+            const titulo = document.createElement("div");
+            titulo.textContent = registro.nome + " - " + formatarBytes(registro.bytes || 0);
+            const detalhe = document.createElement("div");
+            detalhe.style.cssText = "color:#8b92a3;font-size:11px;";
+            detalhe.textContent = new Date(registro.em).toLocaleString() + " - " + (registro.chatTitle || registro.chatId || "") + " - " + registro.relativo;
+            linha.appendChild(titulo);
+            linha.appendChild(detalhe);
+            const acoes = document.createElement("div");
+            acoes.style.cssText = "display:flex;gap:6px;margin-top:3px;";
+            linha.appendChild(acoes);
+            // URL pronta so pros 30 primeiros (o resto mostra so o caminho).
+            if (i < 30) revogacoesDaTelaDownloads.push(montarAcoesDoArquivo(acoes, registro));
+            else {
+                const botao = document.createElement("button");
+                botao.textContent = "Mostrar botoes";
+                botao.style.cssText = "background:#2a2f3a;border:none;border-radius:4px;color:#e6e8ec;cursor:pointer;font-size:11px;padding:2px 8px;";
+                botao.addEventListener("click", () => {
+                    botao.remove();
+                    revogacoesDaTelaDownloads.push(montarAcoesDoArquivo(acoes, registro));
+                });
+                acoes.appendChild(botao);
+            }
+            historico.appendChild(linha);
+        }
+    }
+
+    // ---- 8. Alt+clique ----
+
+    // Tarefa da fila pra baixar a midia de UMA mensagem (o Alt+clique e o
+    // download em lote usam a mesma). "pasta" ja vem resolvida do gesto do
+    // clique (ou null). "mensagemPronta" evita pedir de novo quando quem
+    // chama ja tem a mensagem (lote, album).
+    function tarefaDeBaixarMensagem({ chatId, messageId, usuarioDoChat, pasta, mensagemPronta, entidadePronta, subpasta, aoConcluir }) {
+        return {
+            rotulo: "mensagem " + messageId,
+            messageId,
+            async executar(ctx) {
+                const cli = await obterClienteParaFerramentas();
+                const entidade = entidadePronta || (await resolverChatParaFerramentas(cli, chatId, usuarioDoChat, ctx));
+                const mensagem =
+                    mensagemPronta || (await buscarMensagensPorId(cli, entidade, [messageId], ctx)).get(messageId);
+                if (!mensagem) throw erroComMensagem("mensagem nao encontrada no servidor (apagada?)");
+                const resultado = await baixarMidiaParaDestino(cli, mensagem, chatId, entidade, pasta, ctx, subpasta);
+                if (aoConcluir) await aoConcluir(resultado);
+                return resultado;
+            },
+        };
+    }
+
+    // Album: o Telegram junta as mensagens pelo grouped_id e um album tem
+    // no maximo 10 itens, entao basta pedir os 9 ids de cada lado e ficar
+    // com os do mesmo grupo.
+    async function mensagensDoAlbum(cli, entidade, messageId, ctx) {
+        const ids = [];
+        for (let id = Math.max(1, messageId - 9); id <= messageId + 9; id++) ids.push(id);
+        const porId = await buscarMensagensPorId(cli, entidade, ids, ctx);
+        const clicada = porId.get(messageId);
+        if (!clicada) throw erroComMensagem("mensagem nao encontrada no servidor (apagada?)");
+        if (clicada.groupedId == null) return [clicada];
+        const grupo = String(clicada.groupedId);
+        return [...porId.values()].filter((m) => m.groupedId != null && String(m.groupedId) === grupo).sort((a, b) => a.id - b.id);
+    }
+
+    // Alt+Shift+clique: uma tarefa curta que descobre os itens do album e
+    // enfileira um download por item.
+    function enfileirarAlbum(ids, pasta) {
+        const resultadoDoAlbum = enfileirarDownload({
+            rotulo: "album da mensagem " + ids.messageId,
+            async executar(ctx) {
+                const cli = await obterClienteParaFerramentas();
+                const entidade = await resolverChatParaFerramentas(cli, ids.chatId, ids.usuarioDoChat, ctx);
+                const itens = await mensagensDoAlbum(cli, entidade, ids.messageId, ctx);
+                ctx.aoNome("album: " + itens.length + " item(ns) enfileirado(s)", 0);
+                for (const mensagem of itens) {
+                    enfileirarDownload(
+                        tarefaDeBaixarMensagem({ ...ids, messageId: mensagem.id, pasta, mensagemPronta: mensagem, entidadePronta: entidade })
+                    );
+                }
+                return { onde: "fila", nome: "album", bytes: 0, soEnfileirou: true };
+            },
+        });
+        return resultadoDoAlbum;
+    }
+
+    // Alt+clique (e Alt+Shift+clique) em cima de uma mensagem. Ordem: tudo
+    // que precisa do gesto do clique (permissao da pasta) acontece ANTES de
+    // qualquer chamada de rede.
+    async function aoAltCliqueEmMensagem(ids, comShift) {
+        const pasta = await pastaComPermissaoNoGesto();
+        if (comShift) return enfileirarAlbum(ids, pasta);
+        return enfileirarDownload(tarefaDeBaixarMensagem({ ...ids, pasta }));
+    }
+
+    // Um unico ouvinte de clique pra todas as ferramentas de Alt+clique.
+    // Clique sem Alt sai na primeira linha; com Alt, cada ferramenta ligada
+    // olha se o clique e com ela (link t.me primeiro, depois midia).
+    const tratadoresDeAltClique = []; // funcoes (evento) -> true se assumiu o clique
+
+    function aoClicarComAlt(evento) {
+        if (!evento.altKey || evento.button !== 0 || evento.ctrlKey || evento.metaKey) return;
+        if (painel && painel.contains(evento.target)) return;
+        if (centralDeDownloads && centralDeDownloads.caixa.contains && centralDeDownloads.caixa.contains(evento.target)) return;
+        for (const tratar of tratadoresDeAltClique) {
+            try {
+                if (tratar(evento)) {
+                    evento.preventDefault();
+                    evento.stopPropagation();
+                    return;
+                }
+            } catch (erro) {
+                console.warn("[Gestor TLGR] ferramenta de Alt+clique:", erro);
+            }
+        }
+    }
+
+    function tratarAltCliqueEmMidia(evento) {
+        if (!ferramentaBaixarMidiaLigada()) return false;
+        const naK = location.pathname.startsWith("/k");
+        const naA = location.pathname.startsWith("/a");
+        if (!naK && !naA) return false;
+        const ids = idsDoElementoClicado(evento.target);
+        if (!ids) return false;
+        aoAltCliqueEmMensagem(ids, !!evento.shiftKey).catch((erro) => console.warn("[Gestor TLGR] Alt+clique:", erro));
+        return true;
+    }
+
+    // Cada ferramenta registra a sua linha aqui: { rotulo, info, ligada(),
+    // ligar(sim), padrao, botao? { texto, textoNoMenu, aoClicar } }.
+    const linhasDoMenuFerramentas = [];
+
+    linhasDoMenuFerramentas.push({
+        rotulo: "Alt+clique numa foto/video/arquivo baixa o original",
+        info:
+            "Ligado por padrao. Funciona com o painel fechado, em web.telegram.org/k/ (e /a/, nao testado no Telegram real). Segure Alt e clique na mensagem: o arquivo e gravado em pedacos na pasta de dados do painel, subpasta Downloads_TLGR (memoria baixa mesmo em video grande). Alt+Shift+clique num album baixa o album inteiro. Varios cliques entram numa fila (2 ao mesmo tempo); o aviso no canto inferior esquerdo mostra %, velocidade, tempo restante e tem Cancelar. Sem a pasta liberada, arquivos ate 200 MB vao pra pasta Downloads do navegador. Clique sem Alt continua normal.",
+        ligada: ferramentaBaixarMidiaLigada,
+        ligar: ligarFerramentaBaixarMidia,
+        padrao: true,
+    });
+
+    // O liga/desliga de cada linha fica em Configuracoes > Ferramentas
+    // (configuracoes.js); ferramenta com tela propria (botao) tambem ganha
+    // um botao no menu quando ligada.
+
+    try {
+        tratadoresDeAltClique.push(tratarAltCliqueEmMidia);
+        document.addEventListener("click", aoClicarComAlt, true);
+        // Aba fechando/recarregando: solta a trava na hora (qualquer dono
+        // desta aba), pra proxima abertura nao esperar ela vencer.
+        if (typeof window !== "undefined" && window && typeof window.addEventListener === "function") {
+            window.addEventListener("pagehide", () => {
+                soltarTravaDoServidor(null);
+                for (const url of urlsParaLiberarNoFim.splice(0)) URL.revokeObjectURL(url);
+            });
+        }
+        if (ferramentaBaixarMidiaLigada()) carregarPastaParaDownloads();
+    } catch (erro) {
+        console.warn("[Gestor TLGR] ferramentas em segundo plano nao iniciaram:", erro);
+    }
+    // ==== Fim do nucleo das ferramentas ====
+
+    // ==== Ferramenta: download em lote ====
+    //
+    // Baixa as midias de UM chat ja escaneado, filtrando pelo que o painel
+    // ja tem no indice (periodo e minimo de reacoes) e pelo tipo (foto,
+    // video, arquivo, audio - descoberto pedindo as mensagens ao Telegram
+    // em blocos de TAMANHO_BLOCO_LOTE). Usa a mesma fila, o mesmo motor e o
+    // mesmo gravador em pedacos do Alt+clique (ferramentas_fundo.js).
+    //
+    // Arquivos ficam em <pasta de dados>/Downloads_TLGR/<titulo do chat>/.
+    // Estado e registro ficam na propria pasta:
+    //   Downloads_TLGR/lote_estado.json    - o lote atual (filtros, lista de
+    //                                         mensagens candidatas, posicao)
+    //   Downloads_TLGR/lote_baixados.jsonl - uma linha por mensagem ja
+    //                                         baixada ("chatId:messageId");
+    //                                         nunca baixa a mesma duas vezes
+    // Retoma sozinho ao recarregar a aba (se a pasta continuar liberada) ou
+    // pelo botao "Continuar" da tela. Duas abas abertas nao rodam o mesmo
+    // lote: uma trava com "batimento" no armazenamento do Tampermonkey.
+
+    const CHAVE_FERRAMENTA_LOTE = "trp_ferramenta_lote";
+    const CAMINHO_ESTADO_LOTE = PASTA_DOWNLOADS + "/lote_estado.json";
+    const CAMINHO_BAIXADOS_LOTE = PASTA_DOWNLOADS + "/lote_baixados.jsonl";
+    const TAMANHO_BLOCO_LOTE = 20; // mensagens pedidas ao Telegram por vez (e no maximo isso na fila por vez)
+    const VALIDADE_TRAVA_LOTE_MS = VALIDADE_TRAVA_DO_SERVIDOR_MS;
+    const TIPOS_DE_MIDIA = [
+        { valor: "foto", rotulo: "Fotos" },
+        { valor: "video", rotulo: "Videos" },
+        { valor: "arquivo", rotulo: "Arquivos" },
+        { valor: "audio", rotulo: "Audios" },
+    ];
+
+    function ferramentaLoteLigada() {
+        return GM_getValue(CHAVE_FERRAMENTA_LOTE, false) === true;
+    }
+
+    function ligarFerramentaLote(ligada) {
+        GM_setValue(CHAVE_FERRAMENTA_LOTE, !!ligada);
+        if (!ligada && loteEmExecucao) pararLote(false);
+    }
+
+    // Tipo de midia de uma mensagem pro filtro do lote, ou null (sem
+    // midia, figurinha, emoji animado, previa de link, enquete...).
+    function tipoDaMidia(mensagem) {
+        const media = mensagem && mensagem.media;
+        if (!media) return null;
+        if (media.className === "MessageMediaPhoto") return media.photo && media.photo.className !== "PhotoEmpty" ? "foto" : null;
+        if (media.className !== "MessageMediaDocument" || !media.document || media.document.className === "DocumentEmpty") return null;
+        const doc = media.document;
+        const atributos = doc.attributes || [];
+        const tem = (nome) => atributos.some((a) => a.className === nome);
+        if (tem("DocumentAttributeSticker") || tem("DocumentAttributeCustomEmoji")) return null;
+        const mime = doc.mimeType || "";
+        if (tem("DocumentAttributeVideo") || tem("DocumentAttributeAnimated") || mime.startsWith("video/")) return "video";
+        if (tem("DocumentAttributeAudio") || mime.startsWith("audio/")) return "audio";
+        return "arquivo";
+    }
+
+    // Mensagens do indice do painel que passam nos filtros de periodo e
+    // reacoes, em ordem de id (mais antiga primeiro). O tipo de midia nao
+    // esta no indice - e conferido depois, ao pedir as mensagens.
+    function candidatosDoLote(db, { chatId, dataDe, dataAte, minimo }) {
+        const ids = [];
+        for (const registro of db.indice.values()) {
+            if (registro.chatId !== chatId) continue;
+            if ((registro.reactionTotal || 0) < (minimo || 0)) continue;
+            const data = (registro.dateUtc || "").slice(0, 10);
+            if (dataDe && data < dataDe) continue;
+            if (dataAte && data > dataAte) continue;
+            ids.push(registro.messageId);
+        }
+        return ids.sort((a, b) => a - b);
+    }
+
+    function subpastaDoChat(chatTitle, chatId) {
+        return nomeSeguro((chatTitle || "chat") + " (" + chatId + ")").replace(/^\.+/, "_");
+    }
+
+    async function lerEstadoDoLote(pastaRaiz) {
+        const texto = await lerArquivoTexto(pastaRaiz, CAMINHO_ESTADO_LOTE).catch(() => null);
+        if (!texto) return null;
+        try {
+            return JSON.parse(texto);
+        } catch (erro) {
+            return null;
+        }
+    }
+
+    async function salvarEstadoDoLote(pastaRaiz, estado) {
+        estado.atualizadoEm = new Date().toISOString();
+        await sobrescreverArquivoTexto(pastaRaiz, CAMINHO_ESTADO_LOTE, JSON.stringify(estado));
+        if (aoMudarLote) aoMudarLote(estado);
+    }
+
+    async function lerRegistroDeBaixados(pastaRaiz) {
+        const texto = await lerArquivoTexto(pastaRaiz, CAMINHO_BAIXADOS_LOTE).catch(() => null);
+        return new Set(repetirJsonlUltimaVence(texto, "chave").keys());
+    }
+
+    function registrarBaixado(pastaRaiz, chave, resultado) {
+        return anexarArquivoTexto(
+            pastaRaiz,
+            CAMINHO_BAIXADOS_LOTE,
+            JSON.stringify({ chave, arquivo: resultado.onde, bytes: resultado.bytes, em: new Date().toISOString() }) + "\n"
+        );
+    }
+
+    // ---- trava entre abas ----
+    // A trava e a do nucleo (pegarTravaDoServidor, ferramentas_fundo.js),
+    // compartilhada com a verificacao dos Monitorados: so um trabalho
+    // pesado no servidor por vez, em todas as abas.
+    function pegarTravaDoLote() {
+        return pegarTravaDoServidor("lote");
+    }
+    function soltarTravaDoLote() {
+        soltarTravaDoServidor("lote");
+    }
+
+    // ---- execucao ----
+    let loteEmExecucao = null; // { estado, parar, cancelarTudo, itens: Set }
+    let aoMudarLote = null; // a tela do lote se registra aqui pra redesenhar o status
+
+    function pararLote(cancelar) {
+        if (!loteEmExecucao) return;
+        loteEmExecucao.parar = true;
+        loteEmExecucao.cancelarTudo = !!cancelar;
+        loteEmExecucao.controle.abort(); // interrompe tambem uma pausa de flood em andamento
+        for (const item of loteEmExecucao.itens) item.cancelar();
+    }
+
+    // Roda (ou retoma) o lote salvo. Vai em blocos: pede as mensagens do
+    // bloco, enfileira as que tem midia do tipo pedido e ainda nao foram
+    // baixadas, espera o bloco inteiro terminar e so entao avanca a posicao
+    // salva. Parou no meio (aba fechou, Pausar): na retomada o mesmo bloco
+    // e pedido de novo e o registro pula o que ja foi baixado.
+    // loteEmExecucao e preenchido ANTES do primeiro await: dois cliques em
+    // "Continuar" (ou o clique junto com a retomada automatica) rodavam o
+    // lote duas vezes e baixavam tudo em dobro (achado na revisao da
+    // rodada 3).
+    function rodarLote(pastaRaiz) {
+        if (loteEmExecucao) return loteEmExecucao.promessa;
+        const execucao = { estado: null, parar: false, cancelarTudo: false, itens: new Set(), controle: new AbortController() };
+        loteEmExecucao = execucao;
+        let estado = null;
+        const ctxDoLote = {
+            sinal: execucao.controle.signal,
+            aoPausa(segundos, premium) {
+                execucao.pausa = segundos;
+                if (premium) estado.limitadoPremium = true;
+                if (aoMudarLote && estado) aoMudarLote(estado);
+            },
+        };
+        execucao.promessa = (async () => {
+            let batimento = null;
+            let temTrava = false;
+            try {
+                estado = await lerEstadoDoLote(pastaRaiz);
+                if (!estado || estado.status === "concluido" || estado.status === "cancelado") return null;
+                execucao.estado = estado;
+                if (!pegarTravaDoLote()) throw erroComMensagem("outro trabalho no servidor esta rodando (" + descricaoDaTravaDoServidor() + ") - o lote continua quando ele terminar", { outraAba: true });
+                temTrava = true;
+                // Se outra aba tomar a trava (ex.: esta aba ficou em segundo
+                // plano e o navegador atrasou o timer por mais de 30 s), esta
+                // para - nunca as duas rodando o mesmo lote.
+                batimento = setInterval(() => {
+                    if (!pegarTravaDoLote()) {
+                        console.warn("[Gestor TLGR] lote: outra aba assumiu - parando aqui");
+                        pararLote(false);
+                    }
+                }, VALIDADE_TRAVA_LOTE_MS / 3);
+                estado.status = "rodando";
+                estado.ultimoErro = null;
+                await salvarEstadoDoLote(pastaRaiz, estado);
+                const registro = await lerRegistroDeBaixados(pastaRaiz);
+                const cli = await obterClienteParaFerramentas();
+                const entidade = await resolverChatParaFerramentas(cli, estado.chatId, null, ctxDoLote);
+                const subpasta = subpastaDoChat(estado.chatTitle, estado.chatId);
+                while (!execucao.parar && estado.posicao < estado.candidatos.length) {
+                    const bloco = estado.candidatos.slice(estado.posicao, estado.posicao + TAMANHO_BLOCO_LOTE);
+                    const pendentes = bloco.filter((id) => !registro.has(estado.chatId + ":" + id));
+                    const porId = pendentes.length ? await buscarMensagensPorId(cli, entidade, pendentes, ctxDoLote) : new Map();
+                    let jaTinhaNoBloco = bloco.length - pendentes.length;
+                    let puladasNoBloco = 0;
+                    const itens = [];
+                    for (const id of pendentes) {
+                        const mensagem = porId.get(id);
+                        const tipo = tipoDaMidia(mensagem);
+                        if (!tipo || !estado.filtros.tipos.includes(tipo)) {
+                            puladasNoBloco++;
+                            continue;
+                        }
+                        const chave = estado.chatId + ":" + id;
+                        const item = enfileirarDownload(
+                            tarefaDeBaixarMensagem({
+                                chatId: estado.chatId,
+                                messageId: id,
+                                pasta: pastaRaiz,
+                                mensagemPronta: mensagem,
+                                entidadePronta: entidade,
+                                subpasta,
+                                aoConcluir: async (resultado) => {
+                                    await registrarBaixado(pastaRaiz, chave, resultado);
+                                    registro.add(chave);
+                                },
+                            })
+                        );
+                        execucao.itens.add(item);
+                        itens.push(item);
+                    }
+                    const terminados = await Promise.all(itens.map((item) => item.promessa));
+                    if (terminados.some((item) => item.limitePremium)) estado.limitadoPremium = true;
+                    let falhasNoBloco = [];
+                    let baixadosNoBloco = 0;
+                    for (const item of terminados) {
+                        execucao.itens.delete(item);
+                        if (item.estado === "ok") baixadosNoBloco++;
+                        else if (item.estado === "erro") falhasNoBloco.push({ id: item.tarefa.messageId, erro: mensagemDoErro(item.erro) });
+                    }
+                    // Bloco interrompido: nao conta nada dele aqui - na
+                    // retomada o bloco e pedido de novo e o que ja foi baixado
+                    // entra como "ja baixadas antes" (pelo registro).
+                    if (execucao.parar) break;
+                    estado.baixados += baixadosNoBloco;
+                    estado.jaTinha += jaTinhaNoBloco;
+                    estado.pulados += puladasNoBloco;
+                    estado.falhas = (estado.falhas || []).concat(falhasNoBloco).slice(-50);
+                    estado.posicao += bloco.length;
+                    await salvarEstadoDoLote(pastaRaiz, estado);
+                }
+                if (execucao.parar) estado.status = execucao.cancelarTudo ? "cancelado" : "pausado";
+                else estado.status = "concluido";
+                await salvarEstadoDoLote(pastaRaiz, estado);
+                return estado;
+            } catch (erro) {
+                if (!temTrava || !estado) throw erro; // lote de outra aba: nao mexe no estado dela
+                if (execucao.parar && erro && erro.cancelado) {
+                    // Pausar/Cancelar no meio de uma pausa de flood: parada normal
+                    estado.status = execucao.cancelarTudo ? "cancelado" : "pausado";
+                    await salvarEstadoDoLote(pastaRaiz, estado).catch(() => {});
+                    return estado;
+                }
+                estado.status = "pausado";
+                estado.ultimoErro = mensagemDoErro(erro);
+                await salvarEstadoDoLote(pastaRaiz, estado).catch(() => {});
+                throw erro;
+            } finally {
+                if (batimento) clearInterval(batimento);
+                if (temTrava) soltarTravaDoLote();
+                loteEmExecucao = null;
+                if (aoMudarLote && estado) aoMudarLote(estado);
+            }
+        })();
+        return execucao.promessa;
+    }
+
+    // Trava ocupada (verificacao dos Monitorados, ou lote em outra aba):
+    // espera e comeca sozinho quando ela soltar (antes so dizia "continua
+    // quando terminar" e nunca continuava - revisao da rodada 4). Confere a
+    // cada 5 s, ate 6 h; Pausar/Cancelar param a espera.
+    let esperaDoLote = null;
+    function rodarLoteQuandoLiberar(pastaRaiz) {
+        if (esperaDoLote) return esperaDoLote.promessa;
+        const espera = { parar: false };
+        esperaDoLote = espera;
+        espera.promessa = (async () => {
+            const limite = Date.now() + 6 * 3600 * 1000;
+            try {
+                for (;;) {
+                    try {
+                        return await rodarLote(pastaRaiz);
+                    } catch (erro) {
+                        if (!(erro && erro.outraAba) || espera.parar || Date.now() > limite) throw erro;
+                        if (aoMudarLote) aoMudarLote(null, "Esperando " + descricaoDaTravaDoServidor() + " terminar - o lote comeca sozinho depois.");
+                        while (!espera.parar && Date.now() < limite) {
+                            await new Promise((r) => setTimeout(r, 5000));
+                            const trava = lerTravaDoServidor();
+                            if (!trava || trava.ate <= Date.now()) break;
+                        }
+                        if (espera.parar) return null;
+                    }
+                }
+            } finally {
+                if (esperaDoLote === espera) esperaDoLote = null;
+            }
+        })();
+        return espera.promessa;
+    }
+    function pararEsperaDoLote() {
+        if (esperaDoLote) esperaDoLote.parar = true;
+    }
+
+    // Antes de iniciar (rodada 5): quantos arquivos o lote vai baixar e
+    // o tamanho total. O tamanho vem dos DADOS das mensagens (tamanho do
+    // documento, maior tamanho da foto) - pede as mensagens ao Telegram,
+    // 100 por chamada, sem baixar nenhum arquivo. Pausa de flood com
+    // contagem. Ja baixadas antes (registro) ficam de fora.
+    async function estimarLote(pastaRaiz, db, filtros, aoProgresso, sinal) {
+        const candidatos = candidatosDoLote(db, filtros);
+        const registro = await lerRegistroDeBaixados(pastaRaiz);
+        const pendentes = candidatos.filter((id) => !registro.has(filtros.chatId + ":" + id));
+        const resultado = { mensagens: candidatos.length, jaBaixados: candidatos.length - pendentes.length, arquivos: 0, bytes: 0, semTamanho: 0, porTipo: {} };
+        if (!pendentes.length) return resultado;
+        const ctx = {
+            sinal,
+            aoPausa: (segundos, premium) => segundos && aoProgresso((premium ? "O Telegram reduziu a velocidade (conta sem Premium): " : "Telegram pediu pausa: ") + segundos + "s..."),
+        };
+        const cli = await obterClienteParaFerramentas();
+        const entidade = await resolverChatParaFerramentas(cli, filtros.chatId, null, ctx);
+        for (let i = 0; i < pendentes.length; i += 100) {
+            if (sinal && sinal.aborted) throw erroDeCancelado();
+            aoProgresso("Conferindo o tamanho no Telegram: " + Math.min(i + 100, pendentes.length) + " de " + pendentes.length + " mensagens (nao baixa nada)...");
+            const porId = await buscarMensagensPorId(cli, entidade, pendentes.slice(i, i + 100), ctx);
+            for (const mensagem of porId.values()) {
+                const tipo = tipoDaMidia(mensagem);
+                if (!tipo || !filtros.tipos.includes(tipo)) continue;
+                resultado.arquivos++;
+                resultado.porTipo[tipo] = (resultado.porTipo[tipo] || 0) + 1;
+                let tamanho = 0;
+                try {
+                    tamanho = alvoDaMensagem(mensagem, filtros.chatId).tamanho || 0;
+                } catch (erro) {
+                    tamanho = 0;
+                }
+                if (tamanho > 0) resultado.bytes += tamanho;
+                else resultado.semTamanho++;
+            }
+        }
+        return resultado;
+    }
+
+    function textoDaEstimativa(e) {
+        if (!e.mensagens) return "Nenhuma mensagem escaneada passa nesses filtros.";
+        const tipos = Object.entries(e.porTipo)
+            .map(([tipo, n]) => n + " " + tipo + (n > 1 ? "s" : ""))
+            .join(", ");
+        return (
+            e.arquivos + " arquivo(s) pra baixar" + (tipos ? " (" + tipos + ")" : "") +
+            ", ~" + formatarBytes(e.bytes) + " no total" +
+            (e.semTamanho ? " (+" + e.semTamanho + " sem tamanho informado pelo Telegram)" : "") +
+            (e.jaBaixados ? "; " + e.jaBaixados + " mensagem(ns) ja baixada(s) antes ficam de fora" : "") + "."
+        );
+    }
+
+    async function criarLote(pastaRaiz, db, { chatId, chatTitle, tipos, dataDe, dataAte, minimo, estimativa }) {
+        const candidatos = candidatosDoLote(db, { chatId, dataDe, dataAte, minimo });
+        const estado = {
+            versao: 1,
+            chatId,
+            chatTitle,
+            filtros: { tipos, dataDe, dataAte, minimo },
+            candidatos,
+            posicao: 0,
+            status: "pausado",
+            baixados: 0,
+            jaTinha: 0,
+            pulados: 0,
+            falhas: [],
+            estimativa: estimativa ? { arquivos: estimativa.arquivos, bytes: estimativa.bytes } : null,
+            criadoEm: new Date().toISOString(),
+        };
+        await salvarEstadoDoLote(pastaRaiz, estado);
+        return estado;
+    }
+
+    // Retomada ao carregar a pagina: so se a ferramenta estiver ligada, o
+    // lote salvo estiver "rodando" (a aba fechou no meio) e a pasta ja
+    // estiver liberada (sem gesto nao da pra pedir permissao). Espera um
+    // pouco pro Telegram Web terminar de carregar primeiro.
+    // A trava da aba anterior (recarregada) pode ainda valer por ate 30 s
+    // se o navegador nao avisou o fechamento (pagehide): nesse caso tenta
+    // de novo quando ela vencer, algumas vezes.
+    async function retomarLoteAoCarregar(tentativa = 0) {
+        if (!ferramentaLoteLigada()) return;
+        const pasta = await garantirPastaDeArmazenamento().catch(() => null);
+        if (!pasta) return;
+        const estado = await lerEstadoDoLote(pasta);
+        if (!estado || estado.status !== "rodando") return;
+        rodarLoteQuandoLiberar(pasta).catch((erro) => console.warn("[Gestor TLGR] lote:", erro));
+    }
+
+    function textoDoEstadoDoLote(estado) {
+        if (!estado) return "Nenhum lote criado ainda.";
+        const total = estado.candidatos.length;
+        const tipos = estado.filtros.tipos.join(", ");
+        const linhas = [
+            (estado.chatTitle || estado.chatId) + " - " + tipos + (estado.filtros.minimo ? ", " + estado.filtros.minimo + "+ reacoes" : "") +
+                (estado.filtros.dataDe || estado.filtros.dataAte ? ", " + (estado.filtros.dataDe || "...") + " a " + (estado.filtros.dataAte || "...") : ""),
+            "Situacao: " + estado.status + " - mensagens verificadas " + estado.posicao + " de " + total,
+            "Baixadas: " + estado.baixados + " | ja baixadas antes: " + estado.jaTinha + " | sem midia do tipo pedido: " + estado.pulados +
+                " | falhas: " + (estado.falhas || []).length,
+        ];
+        if (estado.estimativa) linhas.push("Estimativa no inicio: " + estado.estimativa.arquivos + " arquivo(s), ~" + formatarBytes(estado.estimativa.bytes));
+        const limitado = estado.limitadoPremium || (loteEmExecucao && [...loteEmExecucao.itens].some((i) => i.limitePremium));
+        if (limitado) linhas.push("Aviso: " + TEXTO_LIMITE_PREMIUM + ".");
+        if (loteEmExecucao && loteEmExecucao.pausa) linhas.push("Telegram pediu pausa: " + loteEmExecucao.pausa + "s");
+        if (estado.ultimoErro) linhas.push("Ultimo erro: " + estado.ultimoErro);
+        return linhas.join("\n");
+    }
+
+    // ---- tela ----
+    async function telaLote() {
+        definirTituloTela("Download em lote");
+        const corpo = corpoDoPainel();
+        botaoVoltar(corpo);
+        const db = await abrirBanco();
+        const pasta = pastaDeArmazenamento;
+
+        const status = document.createElement("div");
+        status.style.cssText = "color:#8b92a3;white-space:pre-line;margin-bottom:8px;font-size:12px;";
+        corpo.appendChild(status);
+        const botoes = document.createElement("div");
+        botoes.style.cssText = "display:flex;gap:8px;margin-bottom:14px;";
+        corpo.appendChild(botoes);
+        const criarBotaoPequeno = (texto, cor) => {
+            const botao = document.createElement("button");
+            botao.textContent = texto;
+            botao.style.cssText =
+                "flex:1;padding:8px;border:none;border-radius:6px;background:" + cor + ";color:#fff;font-weight:600;cursor:pointer;";
+            botoes.appendChild(botao);
+            return botao;
+        };
+        const botaoContinuar = criarBotaoPequeno("Continuar", "#4da3ff");
+        const botaoPausar = criarBotaoPequeno("Pausar", "#2a2f3a");
+        const botaoCancelar = criarBotaoPequeno("Cancelar lote", "#3a2f2f");
+
+        let estadoAtual = await lerEstadoDoLote(pasta);
+        let avisoDeEspera = "";
+        const redesenhar = (estado, aviso) => {
+            if (estado) estadoAtual = estado;
+            if (aviso !== undefined) avisoDeEspera = aviso || "";
+            if (!status.isConnected && status.isConnected !== undefined) {
+                if (aoMudarLote === redesenhar) aoMudarLote = null;
+                return;
+            }
+            status.textContent = textoDoEstadoDoLote(estadoAtual) + (avisoDeEspera && !loteEmExecucao ? "\n" + avisoDeEspera : "");
+            if (loteEmExecucao) avisoDeEspera = "";
+            const rodando = !!loteEmExecucao || !!esperaDoLote;
+            const podeContinuar = estadoAtual && !rodando && (estadoAtual.status === "pausado" || estadoAtual.status === "rodando");
+            botaoContinuar.style.display = podeContinuar ? "" : "none";
+            botaoPausar.style.display = rodando ? "" : "none";
+            botaoCancelar.style.display = estadoAtual && (rodando || podeContinuar) ? "" : "none";
+        };
+        aoMudarLote = redesenhar;
+        redesenhar(estadoAtual);
+
+        botaoContinuar.addEventListener("click", () => {
+            rodarLoteQuandoLiberar(pasta).catch((erro) => {
+                status.textContent = textoDoEstadoDoLote(estadoAtual) + "\nErro: " + mensagemDoErro(erro);
+            });
+            setTimeout(() => redesenhar(), 50);
+        });
+        botaoPausar.addEventListener("click", () => {
+            pararEsperaDoLote();
+            pararLote(false);
+            setTimeout(() => redesenhar(null, ""), 50);
+        });
+        botaoCancelar.addEventListener("click", async () => {
+            pararEsperaDoLote();
+            if (loteEmExecucao) {
+                pararLote(true);
+                return;
+            }
+            if (estadoAtual) {
+                estadoAtual.status = "cancelado";
+                await salvarEstadoDoLote(pasta, estadoAtual);
+            }
+        });
+
+        // ---- novo lote ----
+        const titulo = document.createElement("div");
+        titulo.style.cssText = "color:#8b92a3;font-weight:600;margin-bottom:6px;";
+        titulo.textContent = "Novo lote";
+        corpo.appendChild(titulo);
+
+        const excluidos = carregarGruposExcluidos();
+        const chats = listarChats(db)
+            .filter((c) => !excluidos.has(c.chatId))
+            .sort((a, b) => (a.chatTitle || "").localeCompare(b.chatTitle || ""));
+        const selectGrupo = document.createElement("select");
+        selectGrupo.style.cssText =
+            "width:100%;background:#0c0e12;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:6px;padding:8px;box-sizing:border-box;margin-bottom:8px;";
+        for (const c of chats) {
+            const opcao = document.createElement("option");
+            opcao.value = c.chatId;
+            opcao.textContent = c.chatTitle || c.chatId;
+            selectGrupo.appendChild(opcao);
+        }
+        corpo.appendChild(selectGrupo);
+        ligarCampoAPreferencia(selectGrupo, "lote_grupo");
+        if (!selectGrupo.value && chats.length) selectGrupo.value = chats[0].chatId;
+        const tiposSalvos = String(lerPreferencia("lote_tipos")).split(",");
+
+        const blocoTipos = document.createElement("div");
+        blocoTipos.style.cssText = "display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px;font-size:12px;color:#8b92a3;";
+        const caixasDeTipo = new Map();
+        for (const tipo of TIPOS_DE_MIDIA) {
+            const rotulo = document.createElement("span");
+            rotulo.style.cssText = "display:flex;align-items:center;gap:6px;";
+            const caixa = criarQuadradoMarcavel(tiposSalvos.includes(tipo.valor), () => {
+                gravarPreferencia("lote_tipos", TIPOS_DE_MIDIA.map((t) => t.valor).filter((v) => caixasDeTipo.get(v).checked).join(","));
+            });
+            caixasDeTipo.set(tipo.valor, caixa);
+            const texto = document.createElement("span");
+            texto.textContent = tipo.rotulo;
+            rotulo.appendChild(caixa.elemento);
+            rotulo.appendChild(texto);
+            blocoTipos.appendChild(rotulo);
+        }
+        corpo.appendChild(blocoTipos);
+
+        const dataDe = ligarCampoAPreferencia(campoTexto(corpo, "De (data, opcional)", "date"), "lote_data_de");
+        const dataAte = ligarCampoAPreferencia(campoTexto(corpo, "Ate (data, opcional)", "date"), "lote_data_ate");
+        const minimo = ligarCampoAPreferencia(campoTexto(corpo, "Minimo de reacoes (0 = todas)", "number", "0"), "lote_minimo");
+
+        const resumo = document.createElement("div");
+        resumo.style.cssText = "color:#8b92a3;font-size:12px;margin:6px 0;";
+        const filtrosAtuais = () => ({
+            chatId: selectGrupo.value,
+            chatTitle: (chats.find((c) => c.chatId === selectGrupo.value) || {}).chatTitle || selectGrupo.value,
+            tipos: TIPOS_DE_MIDIA.map((t) => t.valor).filter((v) => caixasDeTipo.get(v).checked),
+            dataDe: dataDe.value || null,
+            dataAte: dataAte.value || null,
+            minimo: parseInt(minimo.value, 10) || 0,
+        });
+        const atualizarResumo = () => {
+            const filtros = filtrosAtuais();
+            if (!filtros.chatId) {
+                resumo.textContent = "Nenhum grupo escaneado ainda.";
+                return;
+            }
+            resumo.textContent =
+                candidatosDoLote(db, filtros).length +
+                " mensagem(ns) escaneada(s) passam no periodo/reacoes - o tipo de midia e conferido no Telegram durante o lote.";
+        };
+        for (const campo of [selectGrupo, dataDe, dataAte, minimo]) campo.addEventListener("change", atualizarResumo);
+        corpo.appendChild(resumo);
+        atualizarResumo();
+
+        // Primeiro clique: estima (quantos arquivos, tamanho total). Segundo:
+        // cria e inicia. Mudou um filtro: volta a estimar.
+        const estimativaTexto = document.createElement("div");
+        estimativaTexto.style.cssText = "color:#e6e8ec;font-size:12px;margin:6px 0;white-space:pre-line;";
+        corpo.appendChild(estimativaTexto);
+        let estimativa = null;
+        const chaveDosFiltros = () => JSON.stringify(filtrosAtuais());
+        const botaoIniciar = botaoAcao(corpo, "Estimar quantidade e tamanho");
+        const voltarAEstimar = () => {
+            estimativa = null;
+            estimativaTexto.textContent = "";
+            botaoIniciar.textContent = "Estimar quantidade e tamanho";
+        };
+        for (const campo of [selectGrupo, dataDe, dataAte, minimo]) campo.addEventListener("change", voltarAEstimar);
+        for (const caixa of caixasDeTipo.values()) caixa.elemento.addEventListener("click", voltarAEstimar);
+        botaoIniciar.addEventListener("click", async () => {
+            const filtros = filtrosAtuais();
+            if (!filtros.chatId || !filtros.tipos.length) {
+                textoAviso(corpo, "Escolha o grupo e pelo menos um tipo de midia.", "#ff6b6b");
+                return;
+            }
+            if (!estimativa || estimativa.chave !== chaveDosFiltros()) {
+                botaoIniciar.disabled = true;
+                try {
+                    const resultado = await estimarLote(pasta, db, filtros, (t) => (estimativaTexto.textContent = t), null);
+                    estimativa = { chave: chaveDosFiltros(), resultado };
+                    estimativaTexto.textContent = textoDaEstimativa(resultado);
+                    botaoIniciar.textContent = resultado.arquivos ? "Iniciar lote: " + resultado.arquivos + " arquivo(s), ~" + formatarBytes(resultado.bytes) : "Nada pra baixar com esses filtros";
+                } catch (erro) {
+                    estimativaTexto.textContent = "Nao deu pra estimar: " + mensagemDoErro(erro);
+                } finally {
+                    botaoIniciar.disabled = false;
+                }
+                return;
+            }
+            if (!estimativa.resultado.arquivos) return;
+            if (loteEmExecucao) {
+                textoAviso(corpo, "Ja tem um lote rodando - pause ou cancele antes.", "#ff6b6b");
+                return;
+            }
+            const anterior = await lerEstadoDoLote(pasta);
+            if (anterior && (anterior.status === "rodando" || anterior.status === "pausado") && !botaoIniciar.dataset.confirmado) {
+                botaoIniciar.dataset.confirmado = "1";
+                botaoIniciar.textContent = "Ja existe um lote pausado - clique de novo pra substituir";
+                return;
+            }
+            botaoIniciar.dataset.confirmado = "";
+            const estado = await criarLote(pasta, db, { ...filtros, estimativa: estimativa.resultado });
+            voltarAEstimar();
+            redesenhar(estado);
+            rodarLoteQuandoLiberar(pasta).catch((erro) => {
+                status.textContent = textoDoEstadoDoLote(estadoAtual) + "\nErro: " + mensagemDoErro(erro);
+            });
+        });
+
+        const nota = document.createElement("div");
+        nota.style.cssText = "color:#8b92a3;font-size:11px;margin-top:10px;";
+        nota.textContent =
+            "So entram mensagens que o scan ja salvou. Os arquivos vao pra Downloads_TLGR/<grupo> na pasta de dados. " +
+            "Pode fechar o painel: o lote continua; se a aba fechar, ele continua sozinho na proxima vez que o Telegram Web abrir (ou pelo botao Continuar).";
+        corpo.appendChild(nota);
+    }
+
+    linhasDoMenuFerramentas.push({
+        rotulo: "Download em lote (midias de um grupo, com filtros)",
+        info:
+            "Desligado por padrao. Baixa as fotos/videos/arquivos/audios de um grupo ja escaneado, filtrando por periodo e minimo de reacoes (ex.: videos com 50+ reacoes nos ultimos 30 dias). Roda em segundo plano na mesma fila do Alt+clique, grava em Downloads_TLGR/<grupo>, nunca baixa a mesma mensagem duas vezes e retoma de onde parou se a aba fechar.",
+        ligada: ferramentaLoteLigada,
+        ligar: ligarFerramentaLote,
+        padrao: false,
+        botao: { texto: "Abrir", textoNoMenu: "Download em lote", aoClicar: () => telaLote() },
+    });
+
+    try {
+        // Aba fechando/recarregando: solta a trava na hora, pra retomada na
+        // proxima abertura nao esperar a trava vencer.
+        if (ferramentaLoteLigada()) setTimeout(() => retomarLoteAoCarregar().catch(() => {}), 8000);
+    } catch (erro) {
+        console.warn("[Gestor TLGR] download em lote nao iniciou:", erro);
+    }
+    // ==== Fim do download em lote ====
+
+    // ==== Ferramenta: Alt+clique num link do Telegram mostra o que e ====
+    //
+    // Ideia vinda da TgFixer (referencias/extensoes_telegram/tgfixer_1.3.1),
+    // mas SEM a parte arriscada: a TgFixer reescreve todo link t.me da
+    // pagina pra tg:// (abre o app instalado) - aqui nada e reescrito e
+    // nada navega (licao da serie v2026.10.12.x). Alt+clique num link
+    // t.me/telegram.me/tg:// so pergunta ao Telegram, pela nossa conexao,
+    // o que tem do outro lado e mostra num aviso: canal/grupo/usuario,
+    // titulo, participantes, se o convite ainda vale, e - em link de
+    // mensagem - se a sua conta consegue ver aquele chat. Clique normal no
+    // link continua com o comportamento de sempre do Telegram Web.
+
+    const CHAVE_FERRAMENTA_LINKS = "trp_ferramenta_links";
+
+    function ferramentaLinksLigada() {
+        return GM_getValue(CHAVE_FERRAMENTA_LINKS, false) === true;
+    }
+
+    function ligarFerramentaLinks(ligada) {
+        GM_setValue(CHAVE_FERRAMENTA_LINKS, !!ligada);
+    }
+
+    // Do href, o que da pra conferir: convite (t.me/+hash, joinchat,
+    // tg://join), @usuario (t.me/usuario, tg://resolve?domain=), com ou sem
+    // id de mensagem, ou link de mensagem de chat privado (t.me/c/<id>/<msg>).
+    function analisarLinkTelegram(href) {
+        let texto = href || "";
+        try {
+            texto = decodeURIComponent(texto);
+        } catch (erro) {
+            // usa como veio
+        }
+        // t.me/c/<id>/<msg> ou, em grupo com topicos, t.me/c/<id>/<topico>/<msg>
+        let m = /(?:t\.me|telegram\.me|telegram\.dog)\/c\/(\d+)\/(\d+)(?:\/(\d+))?/i.exec(texto);
+        if (m) return { tipo: "privado", chatId: "-100" + m[1], messageId: Number(m[3] || m[2]) };
+        // t.me/+5511... e numero de telefone, nao convite
+        if (/(?:t\.me|telegram\.me|telegram\.dog)\/\+\d{6,}(?:[/?#]|$)/i.test(texto)) return { tipo: "telefone" };
+        m = /(?:t\.me|telegram\.me|telegram\.dog)\/(?:\+|joinchat\/)([A-Za-z0-9_-]{5,})/i.exec(texto) || /tg:\/\/join\?invite=([A-Za-z0-9_-]+)/i.exec(texto);
+        if (m) return { tipo: "convite", valor: m[1] };
+        m = /tg:\/\/resolve\?domain=([A-Za-z0-9_]{4,32})(?:&post=(\d+))?/i.exec(texto);
+        if (m) return { tipo: "usuario", valor: m[1], messageId: m[2] ? Number(m[2]) : null };
+        m = /(?:t\.me|telegram\.me|telegram\.dog)\/(?:s\/)?([A-Za-z0-9_]{4,32})(?:\/(\d+))?(?:[/?#]|$)/i.exec(texto);
+        if (m && !/^(joinchat|addstickers|addemoji|share|proxy|socks|setlanguage|addlist|addtheme|addstyle|login|confirmphone|invoice|giftcode|boost|nft|auction|call|m|s|c|iv|bg|contact)$/i.test(m[1])) {
+            return { tipo: "usuario", valor: m[1], messageId: m[2] ? Number(m[2]) : null };
+        }
+        return null;
+    }
+
+    // Campo "https://t.me/ + o resto" da Busca avancada (rodada 4): o
+    // prefixo fica fixo na tela e o usuario digita so o final - mas pode
+    // colar qualquer forma (link completo, t.me/..., telegram.me/...,
+    // @usuario, tg://resolve, tg://join, link do Telegram Web com #@usuario)
+    // e ate varios de uma vez. Devolve a lista do que vem DEPOIS de
+    // "https://t.me/" pra cada link reconhecido (sem repetir).
+    function normalizarLinksDigitados(texto) {
+        let bruto = String(texto || "").trim();
+        try {
+            bruto = decodeURIComponent(bruto);
+        } catch (erro) {
+            // usa como veio
+        }
+        const saida = [];
+        const adicionar = (sufixo) => {
+            const limpo = String(sufixo || "").replace(/[)\].,;!?'"]+$/, "").replace(/\/+$/, "");
+            if (limpo && !saida.some((s) => s.toLowerCase() === limpo.toLowerCase())) saida.push(limpo);
+        };
+        const pedacos = bruto.split(/[\s,]+/).filter(Boolean);
+        for (const pedaco of pedacos) {
+            let m = /^(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)\/(.+)$/i.exec(pedaco);
+            if (m) {
+                adicionar(m[1].replace(/^s\//i, "").split("?")[0].split("#")[0]);
+                continue;
+            }
+            m = /^tg:\/\/resolve\?domain=([A-Za-z0-9_]+)(?:&post=(\d+))?/i.exec(pedaco);
+            if (m) {
+                adicionar(m[1] + (m[2] ? "/" + m[2] : ""));
+                continue;
+            }
+            m = /^tg:\/\/join\?invite=([A-Za-z0-9_-]+)/i.exec(pedaco);
+            if (m) {
+                adicionar("+" + m[1]);
+                continue;
+            }
+            m = /web\.telegram\.org\/[ak]\/#@([A-Za-z0-9_]{4,32})/i.exec(pedaco);
+            if (m) {
+                adicionar(m[1]);
+                continue;
+            }
+            m = /^@([A-Za-z0-9_]{4,32})$/.exec(pedaco);
+            if (m) {
+                adicionar(m[1]);
+                continue;
+            }
+            // So o final, como o campo pede: usuario, usuario/123, +hash,
+            // joinchat/hash, c/123/45.
+            // (So quando foi digitada uma coisa so - no meio de um texto
+            // colado, palavra solta nao e link.)
+            if (pedacos.length === 1 && /^(?:\+[A-Za-z0-9_-]{5,}|joinchat\/[A-Za-z0-9_-]{5,}|c\/\d+\/\d+(?:\/\d+)?|[A-Za-z0-9_]{4,32}(?:\/\d+)?)\/?$/.test(pedaco)) adicionar(pedaco);
+        }
+        return saida;
+    }
+
+    function linkDoClique(alvo) {
+        const ancora = alvo && alvo.closest && alvo.closest("a[href]");
+        if (!ancora) return null;
+        const href = ancora.getAttribute("href") || "";
+        if (!/(?:t\.me|telegram\.me|telegram\.dog)\/|^tg:\/\//i.test(href)) return null;
+        return href;
+    }
+
+    function avisoDoLink(texto, cor) {
+        const caixa = document.createElement("div");
+        Object.assign(caixa.style, {
+            position: "fixed",
+            left: "24px",
+            top: "24px",
+            zIndex: 999999,
+            maxWidth: "420px",
+            padding: "8px 12px",
+            borderRadius: "8px",
+            background: "#1c1f26",
+            color: cor || "#e6e8ec",
+            fontFamily: "sans-serif",
+            fontSize: "12px",
+            boxShadow: "0 2px 10px rgba(0,0,0,0.35)",
+            whiteSpace: "pre-line",
+        });
+        caixa.textContent = texto;
+        document.body.appendChild(caixa);
+        let remocao = null;
+        return {
+            caixa,
+            // so a resposta FINAL agenda a remocao (12 s); a contagem de
+            // pausa so troca o texto (antes cada troca agendava uma remocao
+            // e o aviso sumia antes da resposta chegar)
+            trocar(novoTexto, novaCor, final) {
+                caixa.textContent = novoTexto;
+                if (novaCor) caixa.style.color = novaCor;
+                if (final) {
+                    clearTimeout(remocao);
+                    remocao = setTimeout(() => caixa.remove(), 12000);
+                }
+            },
+        };
+    }
+
+    function descreverChat(chat) {
+        if (!chat) return "?";
+        if (chat.className === "User") {
+            const nome = [chat.firstName, chat.lastName].filter(Boolean).join(" ") || "(sem nome)";
+            return (chat.bot ? "bot " : "usuario ") + nome;
+        }
+        const tipo = chat.broadcast ? "canal" : chat.megagroup ? "supergrupo" : "grupo";
+        const membros = typeof chat.participantsCount === "number" ? ", " + chat.participantsCount + " participantes" : "";
+        return tipo + ' "' + (chat.title || "?") + '"' + membros;
+    }
+
+    // O que o Telegram diz do link. Todas as chamadas com
+    // floodSleepThreshold: 0 por chamada e pausa tratada aqui
+    // (chamarComPausaLocal), igual o download.
+    async function conferirLinkTelegram(link, ctx) {
+        return (await examinarLinkTelegram(link, ctx)).texto;
+    }
+
+    // Igual conferirLinkTelegram, mas devolve tambem o que achou:
+    // { texto, entidade (chat/usuario), chatId (formato do scan),
+    // mensagem (link de mensagem que existe) } - usado pela Busca avancada
+    // pra comparar com o que esta salvo (o antigo "Verificar mensagem").
+    async function examinarLinkTelegram(link, ctx) {
+        const r = await examinarLinkTelegramPorDentro(link, ctx);
+        return typeof r === "string" ? { texto: r } : r;
+    }
+
+    function chatIdDaEntidade(entidade) {
+        if (!entidade) return null;
+        if (entidade.className === "Channel") return "-100" + String(entidade.id);
+        if (entidade.className === "Chat") return "-" + String(entidade.id);
+        return String(entidade.id);
+    }
+
+    async function examinarLinkTelegramPorDentro(link, ctx) {
+        if (link.tipo === "telefone") return "Link de numero de telefone - nao da pra conferir sem abrir.";
+        const cli = await obterClienteParaFerramentas();
+        if (link.tipo === "convite") {
+            try {
+                const r = await chamarComPausaLocal(
+                    () => cli.invoke(new Api.messages.CheckChatInvite({ hash: link.valor }), undefined, { floodSleepThreshold: 0 }),
+                    ctx
+                );
+                if (r.className === "ChatInviteAlready") return "Convite valido - voce ja participa: " + descreverChat(r.chat);
+                if (r.className === "ChatInvitePeek") return "Convite valido - da pra ver o conteudo sem entrar: " + descreverChat(r.chat);
+                const tipo = r.broadcast ? "canal" : r.megagroup ? "supergrupo" : "grupo";
+                return 'Convite valido: ' + tipo + ' "' + (r.title || "?") + '"' + (typeof r.participantsCount === "number" ? ", " + r.participantsCount + " participantes" : "") + (r.requestNeeded ? " (entrada precisa de aprovacao)" : "");
+            } catch (erro) {
+                if (/INVITE_HASH_(EXPIRED|INVALID)/.test(erro && erro.errorMessage)) return "Convite expirado ou invalido.";
+                throw erro;
+            }
+        }
+        if (link.tipo === "usuario") {
+            let r;
+            try {
+                r = await chamarComPausaLocal(
+                    () => cli.invoke(new Api.contacts.ResolveUsername({ username: link.valor }), undefined, { floodSleepThreshold: 0 }),
+                    ctx
+                );
+            } catch (erro) {
+                if (/USERNAME_(NOT_OCCUPIED|INVALID)/.test(erro && erro.errorMessage)) return "@" + link.valor + " nao existe (ou foi apagado).";
+                throw erro;
+            }
+            // o chat certo e o apontado por r.peer (a lista pode trazer outros)
+            const peer = r.peer || {};
+            const idDoPeer = String(peer.channelId != null ? peer.channelId : peer.chatId != null ? peer.chatId : peer.userId);
+            const alvo =
+                [...(r.chats || []), ...(r.users || [])].find((c) => String(c.id) === idDoPeer) ||
+                ((r.chats || [])[0]) ||
+                ((r.users || [])[0]);
+            let texto = "@" + link.valor + ": " + descreverChat(alvo);
+            let mensagem = null;
+            if (link.messageId && alvo && alvo.className === "Channel") {
+                mensagem = (await buscarMensagensPorId(cli, alvo, [link.messageId], ctx)).get(link.messageId) || null;
+                texto += mensagem ? "\nMensagem " + link.messageId + " existe" + (mensagem.media ? " (tem midia)" : "") : "\nMensagem " + link.messageId + " nao existe mais.";
+            }
+            return { texto, entidade: alvo, chatId: chatIdDaEntidade(alvo), mensagem, messageId: link.messageId || null };
+        }
+        // link de chat privado: so da pra ver se a conta participa
+        const entidade = await chamarComPausaLocal(() => encontrarEntidadePorChatId(link.chatId), ctx);
+        if (!entidade) return "Link de mensagem de chat privado em que a sua conta NAO participa - o Telegram nao mostra nada dele.";
+        const mensagem = (await buscarMensagensPorId(cli, entidade, [link.messageId], ctx)).get(link.messageId) || null;
+        return {
+            texto: "Chat privado em que voce participa: " + descreverChat(entidade) + "\nMensagem " + link.messageId + (mensagem ? " existe." : " nao existe mais."),
+            entidade,
+            chatId: link.chatId,
+            mensagem,
+            messageId: link.messageId,
+        };
+    }
+
+    function tratarAltCliqueEmLink(evento) {
+        if (!ferramentaLinksLigada()) return false;
+        const href = linkDoClique(evento.target);
+        if (!href) return false;
+        const link = analisarLinkTelegram(href);
+        if (!link) return false;
+        const caixa = avisoDoLink("Gestor TLGR: conferindo " + href + " ...");
+        // Pausa de flood acima de 60 s: desiste e avisa, em vez de ficar
+        // horas tentando por tras de um aviso que ja sumiu.
+        const ctx = {
+            sinal: null,
+            maximoSegundosDePausa: 60,
+            aoPausa: (s) => s && caixa.trocar("Gestor TLGR: Telegram pediu pausa de " + s + "s..."),
+        };
+        conferirLinkTelegram(link, ctx)
+            .then((texto) => caixa.trocar("Gestor TLGR - " + href + "\n" + texto, "#5ec26a", true))
+            .catch((erro) => caixa.trocar("Gestor TLGR - " + href + "\nNao deu pra conferir: " + mensagemDoErro(erro), "#ff6b6b", true));
+        return true;
+    }
+
+    linhasDoMenuFerramentas.push({
+        rotulo: "Alt+clique num link t.me mostra o que e (sem abrir)",
+        info:
+            "Desligado por padrao. Segure Alt e clique num link t.me/..., telegram.me/... ou tg://: em vez de abrir, aparece um aviso dizendo se e canal, grupo ou usuario, o titulo, quantos participantes, se o convite ainda vale e, em link de mensagem, se ela existe e se a sua conta participa do chat. Nada e aberto nem reescrito; clique sem Alt continua normal.",
+        ligada: ferramentaLinksLigada,
+        ligar: ligarFerramentaLinks,
+        padrao: false,
+    });
+
+    try {
+        tratadoresDeAltClique.unshift(tratarAltCliqueEmLink); // link antes de midia: Alt+clique num link dentro de mensagem e sobre o link
+    } catch (erro) {
+        console.warn("[Gestor TLGR] conferir link nao iniciou:", erro);
+    }
+    // ==== Fim do conferir link ====
+
+    // ==== Favoritos: mensagens e buscas salvas (rodada 4) ====
+    //
+    // Pedido do usuario: favoritar mensagem de qualquer lista (Top reacoes,
+    // Minhas reacoes, Buscar, Monitorados) e tambem a PROPRIA busca (termo +
+    // filtros), pra repetir depois com um clique. Fica em favoritos.json na
+    // pasta de dados (vai junto com a pasta; pequeno, reescrito inteiro a
+    // cada mudanca):
+    //   { mensagens: [{ key, chatId, messageId, chatTitle, dateUtc, trecho, adicionadoEm }],
+    //     buscas:    [{ id, tela, nome, termo, filtros: { preferencia: valor }, criadaEm }] }
+
+    const CAMINHO_FAVORITOS = "favoritos.json";
+    const NOMES_DAS_TELAS_DE_BUSCA = { top: "Top reacoes", minhas: "Minhas reacoes", busca: "Buscar mensagens", avancada: "Busca avancada" };
+
+    // forcar: rele do disco (outra aba pode ter mudado - toda mudanca rele
+    // antes, senao a ultima aba a gravar apagava o que a outra fez).
+    async function carregarFavoritos(db, forcar) {
+        if (db.favoritos && !forcar) return db.favoritos;
+        let dados = null;
+        try {
+            dados = JSON.parse((await lerArquivoTexto(db.pasta, CAMINHO_FAVORITOS)) || "null");
+        } catch (erro) {
+            dados = null;
+        }
+        db.favoritos = {
+            mensagens: (dados && Array.isArray(dados.mensagens) ? dados.mensagens : []).filter((f) => f && f.key),
+            buscas: (dados && Array.isArray(dados.buscas) ? dados.buscas : []).filter((b) => b && b.id),
+        };
+        return db.favoritos;
+    }
+
+    function salvarFavoritos(db) {
+        return sobrescreverArquivoTexto(db.pasta, CAMINHO_FAVORITOS, JSON.stringify(db.favoritos));
+    }
+
+    function ehFavorito(db, key) {
+        return !!(db.favoritos && db.favoritos.mensagens.some((f) => f.key === key));
+    }
+
+    // Liga/desliga. Devolve true se ficou favorito.
+    async function alternarFavorito(db, m, texto) {
+        const favoritos = await carregarFavoritos(db, true);
+        const indice = favoritos.mensagens.findIndex((f) => f.key === m.key);
+        if (indice >= 0) favoritos.mensagens.splice(indice, 1);
+        else {
+            favoritos.mensagens.unshift({
+                key: m.key,
+                chatId: m.chatId,
+                messageId: m.messageId,
+                chatTitle: m.chatTitle,
+                dateUtc: m.dateUtc,
+                trecho: (texto || m.texto || m.trecho || "").slice(0, 300),
+                adicionadoEm: new Date().toISOString(),
+            });
+        }
+        await salvarFavoritos(db);
+        return indice < 0;
+    }
+
+    // Guarda a busca atual: o termo e o valor de cada filtro (preferencia)
+    // da tela naquele momento.
+    async function salvarBusca(db, tela, termo, nomesDePreferencia) {
+        const favoritos = await carregarFavoritos(db, true);
+        const filtros = {};
+        for (const nome of nomesDePreferencia) filtros[nome] = lerPreferencia(nome);
+        const busca = {
+            id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+            tela,
+            nome: (termo ? '"' + termo + '"' : "(sem termo)") + " em " + (NOMES_DAS_TELAS_DE_BUSCA[tela] || tela),
+            termo: termo || "",
+            filtros,
+            criadaEm: new Date().toISOString(),
+        };
+        favoritos.buscas.unshift(busca);
+        await salvarFavoritos(db);
+        return busca;
+    }
+
+    function botaoSalvarBusca(container, db, tela, termo, nomesDePreferencia) {
+        const botao = botaoPequeno(container, "Salvar esta busca nos favoritos", async () => {
+            botao.disabled = true;
+            try {
+                await salvarBusca(db, tela, typeof termo === "function" ? termo() : termo, nomesDePreferencia);
+                botao.textContent = "Busca salva (ver em Favoritos)";
+            } catch (erro) {
+                botao.textContent = "Nao deu pra salvar: " + mensagemDoErro(erro);
+                botao.disabled = false;
+            }
+        });
+        return botao;
+    }
+
+    // Abrir uma busca salva: devolve os filtros dela pras preferencias da
+    // tela e abre a tela ja com o termo (e buscando, quando a tela busca so
+    // com clique).
+    function abrirBuscaSalva(busca) {
+        for (const [nome, valor] of Object.entries(busca.filtros || {})) {
+            if (PREFERENCIAS.has(nome)) gravarPreferencia(nome, valor);
+        }
+        if (busca.tela === "top") return telaResultados();
+        if (busca.tela === "minhas") return telaMinhasReacoes();
+        if (busca.tela === "avancada") return telaBuscaAvancada({ termo: busca.termo, executar: true });
+        return telaBusca({ termo: busca.termo, executar: true });
+    }
+
+    async function telaFavoritos() {
+        definirTituloTela("Favoritos");
+        const corpo = corpoDoPainel();
+        botaoVoltar(corpo);
+        const db = await abrirBanco();
+        const favoritos = await carregarFavoritos(db);
+
+        const tituloBuscas = document.createElement("div");
+        tituloBuscas.style.cssText = "color:#8b92a3;font-weight:600;margin-bottom:6px;";
+        tituloBuscas.textContent = "Buscas salvas (" + favoritos.buscas.length + ")";
+        corpo.appendChild(tituloBuscas);
+        if (!favoritos.buscas.length) {
+            const vazio = document.createElement("div");
+            vazio.style.cssText = "color:#8b92a3;font-size:12px;margin-bottom:10px;";
+            vazio.textContent = 'Nenhuma ainda. Em Top reacoes, Minhas reacoes, Buscar mensagens ou Busca avancada, use "Salvar esta busca nos favoritos".';
+            corpo.appendChild(vazio);
+        }
+        for (const busca of favoritos.buscas) {
+            const linha = document.createElement("div");
+            linha.style.cssText = "display:flex;gap:6px;align-items:center;padding:6px 0;border-bottom:1px solid #2a2f3a;font-size:12px;";
+            const nome = document.createElement("span");
+            nome.style.cssText = "flex:1;min-width:0;";
+            nome.textContent = busca.nome;
+            linha.appendChild(nome);
+            botaoPequeno(linha, "Abrir", () => abrirBuscaSalva(busca));
+            botaoPequeno(linha, "Apagar", async () => {
+                const atuais = await carregarFavoritos(db, true);
+                atuais.buscas = atuais.buscas.filter((b) => b.id !== busca.id);
+                await salvarFavoritos(db);
+                telaFavoritos();
+            });
+            corpo.appendChild(linha);
+        }
+
+        const tituloMensagens = document.createElement("div");
+        tituloMensagens.style.cssText = "color:#8b92a3;font-weight:600;margin:14px 0 6px;";
+        tituloMensagens.textContent = "Mensagens favoritas (" + favoritos.mensagens.length + ")";
+        corpo.appendChild(tituloMensagens);
+        if (!favoritos.mensagens.length) {
+            const vazio = document.createElement("div");
+            vazio.style.cssText = "color:#8b92a3;font-size:12px;";
+            vazio.textContent = 'Nenhuma ainda. Use "Favoritar" em qualquer mensagem das listas.';
+            corpo.appendChild(vazio);
+            return;
+        }
+        const lista = document.createElement("div");
+        corpo.appendChild(lista);
+        for (const favorito of favoritos.mensagens) {
+            // Dados atuais do indice (reacoes, visto) quando a mensagem ainda
+            // esta no banco; senao, o que foi guardado ao favoritar.
+            const atual = db.indice.get(favorito.key);
+            const m = atual ? { ...favorito, ...atual } : favorito;
+            lista.appendChild(
+                criarItemDeMensagem(db, m, {
+                    titulo: (m.dateUtc || "").slice(0, 10) + (m.reactionTotal ? " - " + m.reactionTotal + " reacoes" : ""),
+                    texto: favorito.trecho || m.trecho || "",
+                    tamanhoTexto: 200,
+                })
+            );
+        }
+    }
+    // ==== Fim dos favoritos ====
+
+    // ==== Monitorados: pessoas e palavras acompanhadas (rodada 4) ====
+    //
+    // Pedido do usuario: acompanhar as mensagens de pessoas especificas em
+    // todos os grupos/canais do scan, e saber quando ha mensagem nova.
+    //
+    // - A pessoa e identificada pelo ID do Telegram (nunca pelo nome, que
+    //   muda). Nome atual e nomes anteriores vem de remetentes.json (o scan
+    //   preenche, ver registrarRemetente).
+    // - Caminho local: toda mensagem NOVA que o scan (ou a busca ao vivo)
+    //   salva passa por aoMensagemNovaDosMonitorados - se o autor e
+    //   monitorado, vira "novo". Nenhum scan extra.
+    // - Caminho servidor ("Verificar agora"): messages.search com from_id
+    //   em cada grupo do scan, so a partir da ultima verificacao de cada
+    //   grupo, com progresso por grupo, pausa de flood com contagem,
+    //   retomada de onde parou e a MESMA trava do download em lote (nunca
+    //   dois trabalhos pesados no servidor ao mesmo tempo, em nenhuma aba).
+    // - Rastreador de palavra: mesma ideia, por termo (so caminho local).
+    //
+    // Estado em monitorados.json na pasta de dados:
+    //   { pessoas: [{ id, tipo, apelido, pausado, grupos, fonte, adicionadoEm }],
+    //     verificacoes: { "id|chatId": { ultimoId, verificadoEm, emAndamento } },
+    //     novos: { id: [keys] },
+    //     rastreadores: [{ id, termo, grupos, pausado, achados: [keys], novos: [keys] }],
+    //     ultimaVerificacao }
+    // A contagem de novos tambem vai pro armazenamento do Tampermonkey
+    // (trp_monitorados_novos), pro botao flutuante mostrar o numero sem
+    // precisar abrir a pasta.
+
+    const CAMINHO_MONITORADOS = "monitorados.json";
+    const CHAVE_CONTADOR_NOVOS = "trp_monitorados_novos";
+    const LIMITE_ACHADOS_RASTREADOR = 1000;
+    const LIMITE_NOVOS_POR_ITEM = 2000;
+
+    function estadoMonitoradosVazio() {
+        return { versao: 1, pessoas: [], verificacoes: {}, novos: {}, rastreadores: [], ultimaVerificacao: null };
+    }
+
+    async function lerMonitoradosDoDisco(pasta) {
+        let dados = null;
+        try {
+            dados = JSON.parse((await lerArquivoTexto(pasta, CAMINHO_MONITORADOS)) || "null");
+        } catch (erro) {
+            dados = null;
+        }
+        return estadoDosDados(dados);
+    }
+
+    async function carregarMonitorados(db) {
+        if (db.monitorados) return db.monitorados;
+        db.monitorados = await lerMonitoradosDoDisco(db.pasta);
+        reindexarMonitorados(db);
+        return db.monitorados;
+    }
+
+    function estadoDosDados(dados) {
+        const estado = estadoMonitoradosVazio();
+        if (dados && typeof dados === "object") {
+            estado.pessoas = Array.isArray(dados.pessoas) ? dados.pessoas.filter((p) => p && p.id) : [];
+            estado.verificacoes = dados.verificacoes && typeof dados.verificacoes === "object" ? dados.verificacoes : {};
+            estado.novos = dados.novos && typeof dados.novos === "object" ? dados.novos : {};
+            estado.rastreadores = Array.isArray(dados.rastreadores) ? dados.rastreadores.filter((r) => r && r.id && r.termo) : [];
+            estado.ultimaVerificacao = dados.ultimaVerificacao || null;
+        }
+        return estado;
+    }
+
+    // Duas abas abertas: cada uma tem o estado em memoria e grava o
+    // arquivo inteiro - sem juntar, a ultima a gravar apagava o que a outra
+    // fez (ex.: pessoa adicionada na aba B sumia quando o scan da aba A
+    // gravava um "novo"; achado na revisao da rodada 4). Toda gravacao
+    // agora rele o arquivo e junta:
+    // - lista de pessoas/rastreadores: vale a do DISCO, a nao ser que esta
+    //   gravacao venha de uma mudanca na lista feita aqui (estrutura: true -
+    //   e essas mudancas releem o disco antes, em sincronizarMonitorados);
+    // - "novas" e achados: uniao (zerarNovos: true quando a tela foi vista);
+    // - verificacoes: fica a mais avancada de cada pessoa/grupo.
+    function juntarMonitorados(disco, memoria, { estrutura, zerarNovos }) {
+        const pessoas = estrutura ? memoria.pessoas : disco.pessoas.map((p) => Object.assign(memoria.pessoas.find((m) => String(m.id) === String(p.id)) || {}, p));
+        const porIdMemoria = new Map(memoria.rastreadores.map((r) => [r.id, r]));
+        const porIdDisco = new Map(disco.rastreadores.map((r) => [r.id, r]));
+        const base = estrutura ? memoria.rastreadores : disco.rastreadores;
+        const rastreadores = base.map((r) => {
+            // listas copiadas ANTES de juntar (o objeto da memoria e reaproveitado)
+            const daMemoria = porIdMemoria.get(r.id);
+            const doDisco = porIdDisco.get(r.id);
+            const achados = [...((doDisco && doDisco.achados) || []), ...((daMemoria && daMemoria.achados) || [])];
+            const novosDele = [...((doDisco && doDisco.novos) || []), ...((daMemoria && daMemoria.novos) || [])];
+            const junto = Object.assign(daMemoria || {}, r);
+            junto.achados = [...new Set(achados)].slice(-LIMITE_ACHADOS_RASTREADOR);
+            junto.novos = zerarNovos ? [] : [...new Set(novosDele)];
+            return junto;
+        });
+        const novos = {};
+        if (!zerarNovos) {
+            for (const p of pessoas) {
+                const lista = [...new Set([...(disco.novos[p.id] || []), ...(memoria.novos[p.id] || [])])];
+                if (lista.length) novos[p.id] = lista.slice(-LIMITE_NOVOS_POR_ITEM);
+            }
+        }
+        const ids = new Set(pessoas.map((p) => String(p.id)));
+        const verificacoes = {};
+        for (const fonte of [disco.verificacoes, memoria.verificacoes]) {
+            for (const [chave, v] of Object.entries(fonte)) {
+                if (!ids.has(chave.split("|")[0])) continue;
+                const atual = verificacoes[chave];
+                if (!atual || (v.ultimoId || 0) > (atual.ultimoId || 0) || ((v.ultimoId || 0) === (atual.ultimoId || 0) && fonte === memoria.verificacoes)) verificacoes[chave] = v;
+            }
+        }
+        const ultimas = [disco.ultimaVerificacao, memoria.ultimaVerificacao].filter(Boolean).sort();
+        return { versao: 1, pessoas, verificacoes, novos, rastreadores, ultimaVerificacao: ultimas.length ? ultimas[ultimas.length - 1] : null };
+    }
+
+    // Aplica o resultado no MESMO objeto (telas e a verificacao em andamento
+    // seguram referencia a ele).
+    function aplicarNoEstado(db, novo) {
+        Object.assign(db.monitorados, novo);
+        reindexarMonitorados(db);
+    }
+
+    // Antes de mudar a lista (adicionar, remover, pausar...): traz o que
+    // outra aba gravou.
+    async function sincronizarMonitorados(db) {
+        await carregarMonitorados(db);
+        await (filaDeGravacaoMonitorados = filaDeGravacaoMonitorados.then(async () => {
+            const disco = await lerMonitoradosDoDisco(db.pasta);
+            aplicarNoEstado(db, juntarMonitorados(disco, db.monitorados, {}));
+        }).catch(() => {}));
+        return db.monitorados;
+    }
+
+    // Mapa id -> pessoa (so as ativas) e termos normalizados dos
+    // rastreadores, pro gancho de mensagem nova ser so uma consulta no Map.
+    function reindexarMonitorados(db) {
+        const estado = db.monitorados;
+        db.monitoradosPorId = new Map(estado.pessoas.filter((p) => !p.pausado).map((p) => [String(p.id), p]));
+        db.rastreadoresAtivos = estado.rastreadores
+            .filter((r) => !r.pausado)
+            .map((r) => ({ rastreador: r, palavras: normalizarTexto(r.termo).split(/\s+/).filter(Boolean) }));
+        monitoradosDoBanco = db;
+    }
+    let monitoradosDoBanco = null; // ultimo db com monitorados carregados (pros botoes sincronos)
+
+    let gravacaoMonitoradosAgendada = null;
+    let filaDeGravacaoMonitorados = Promise.resolve();
+    function salvarMonitorados(db, opcoes) {
+        clearTimeout(gravacaoMonitoradosAgendada);
+        gravacaoMonitoradosAgendada = null;
+        const gravacao = filaDeGravacaoMonitorados.then(async () => {
+            const disco = await lerMonitoradosDoDisco(db.pasta);
+            aplicarNoEstado(db, juntarMonitorados(disco, db.monitorados, opcoes || {}));
+            atualizarContadoresDeNovos(db);
+            await sobrescreverArquivoTexto(db.pasta, CAMINHO_MONITORADOS, JSON.stringify(db.monitorados));
+        });
+        filaDeGravacaoMonitorados = gravacao.catch(() => {});
+        atualizarContadoresDeNovos(db);
+        return gravacao;
+    }
+    // Durante o scan o gancho dispara a cada mensagem nova - grava no
+    // maximo a cada 2 s.
+    function agendarGravacaoMonitorados(db) {
+        atualizarContadoresDeNovos(db);
+        if (gravacaoMonitoradosAgendada) return;
+        gravacaoMonitoradosAgendada = setTimeout(() => {
+            gravacaoMonitoradosAgendada = null;
+            salvarMonitorados(db).catch((erro) => console.warn("[Gestor TLGR] monitorados.json:", erro));
+        }, 2000);
+    }
+
+    function estaMonitorado(id) {
+        return !!(monitoradosDoBanco && monitoradosDoBanco.monitorados && monitoradosDoBanco.monitorados.pessoas.some((p) => String(p.id) === String(id)));
+    }
+
+    function grupoValeParaPessoa(pessoa, chatId) {
+        return !pessoa.grupos || pessoa.grupos.includes(chatId);
+    }
+
+    function adicionarNovo(lista, key) {
+        if (lista.includes(key)) return lista;
+        lista.push(key);
+        if (lista.length > LIMITE_NOVOS_POR_ITEM) lista.splice(0, lista.length - LIMITE_NOVOS_POR_ITEM);
+        return lista;
+    }
+
+    // Gancho do caminho local (registrado em aoSalvarMensagemNova).
+    function aoMensagemNovaDosMonitorados(db, registro) {
+        if (!db.monitorados) return;
+        let mudou = false;
+        const pessoa = registro.de && db.monitoradosPorId.get(String(registro.de));
+        if (pessoa && grupoValeParaPessoa(pessoa, registro.chatId)) {
+            db.monitorados.novos[pessoa.id] = adicionarNovo(db.monitorados.novos[pessoa.id] || [], registro.key);
+            mudou = true;
+        }
+        if (db.rastreadoresAtivos.length && registro.texto) {
+            const texto = normalizarTexto(registro.texto);
+            for (const { rastreador, palavras } of db.rastreadoresAtivos) {
+                if (!palavras.length || !grupoValeParaPessoa(rastreador, registro.chatId)) continue;
+                if (!palavras.every((p) => texto.includes(p))) continue;
+                rastreador.achados = adicionarNovo(rastreador.achados || [], registro.key).slice(-LIMITE_ACHADOS_RASTREADOR);
+                rastreador.novos = adicionarNovo(rastreador.novos || [], registro.key);
+                mudou = true;
+            }
+        }
+        if (mudou) agendarGravacaoMonitorados(db);
+    }
+    aoSalvarMensagemNova.push(aoMensagemNovaDosMonitorados);
+
+    function totalDeNovos(estado) {
+        let total = 0;
+        for (const pessoa of estado.pessoas) if (!pessoa.pausado) total += (estado.novos[pessoa.id] || []).length;
+        for (const r of estado.rastreadores) if (!r.pausado) total += (r.novos || []).length;
+        return total;
+    }
+
+    // Numero no botao flutuante e no botao "Monitorados" do menu.
+    function atualizarContadoresDeNovos(db) {
+        const total = db && db.monitorados ? totalDeNovos(db.monitorados) : GM_getValue(CHAVE_CONTADOR_NOVOS, 0) || 0;
+        if (db && db.monitorados) GM_setValue(CHAVE_CONTADOR_NOVOS, total);
+        desenharContadorNoBotaoFlutuante(total);
+        const botaoMenu = painel && painel.querySelector ? painel.querySelector("#trp-botao-monitorados") : null;
+        if (botaoMenu) botaoMenu.textContent = "Monitorados" + (total ? " (" + total + ")" : "");
+        return total;
+    }
+
+    function desenharContadorNoBotaoFlutuante(total) {
+        if (!botaoFlutuante) return;
+        botaoFlutuante.textContent = total ? "Gestor TLGR (" + total + ")" : "Gestor TLGR";
+        botaoFlutuante.style.background = total ? "#e0a93a" : "#4da3ff";
+        botaoFlutuante.title = total ? total + " mensagem(ns) nova(s) de quem voce monitora - abra Monitorados" : "";
+    }
+
+    // ---- quem e o autor ----
+
+    function tipoDoAutor(id, chatId) {
+        if (String(id) === String(chatId)) return "anonimo";
+        return String(id).startsWith("-") ? "canal" : "pessoa";
+    }
+
+    async function adicionarMonitorado(db, { id, tipo, fonte }) {
+        const estado = await sincronizarMonitorados(db);
+        const idTexto = String(id);
+        if (estado.pessoas.some((p) => String(p.id) === idTexto)) return null;
+        const pessoa = { id: idTexto, tipo: tipo || (idTexto.startsWith("-") ? "canal" : "pessoa"), apelido: "", pausado: false, grupos: null, fonte: fonte || null, adicionadoEm: new Date().toISOString() };
+        estado.pessoas.push(pessoa);
+        reindexarMonitorados(db);
+        await salvarMonitorados(db, { estrutura: true });
+        return pessoa;
+    }
+
+    async function removerMonitorado(db, id) {
+        const estado = await sincronizarMonitorados(db);
+        estado.pessoas = estado.pessoas.filter((p) => String(p.id) !== String(id));
+        delete estado.novos[id];
+        for (const chave of Object.keys(estado.verificacoes)) if (chave.startsWith(id + "|")) delete estado.verificacoes[chave];
+        reindexarMonitorados(db);
+        await salvarMonitorados(db, { estrutura: true });
+    }
+
+    async function alterarMonitorado(db, id, mudancas) {
+        const estado = await sincronizarMonitorados(db);
+        const pessoa = estado.pessoas.find((p) => String(p.id) === String(id));
+        if (!pessoa) return;
+        Object.assign(pessoa, mudancas);
+        reindexarMonitorados(db);
+        await salvarMonitorados(db, { estrutura: true });
+    }
+
+    // Rastreadores: mesma regra (rele, muda, grava a lista).
+    async function alterarRastreadores(db, mudar) {
+        const estado = await sincronizarMonitorados(db);
+        mudar(estado);
+        reindexarMonitorados(db);
+        await salvarMonitorados(db, { estrutura: true });
+    }
+
+    // Botao "Monitorar autor" das listas. Autor que a mensagem antiga nao
+    // tem salvo (antes da rodada 4): pede a mensagem ao Telegram (1
+    // chamada) pra descobrir. Admin anonimo: o Telegram nao diz quem e.
+    async function monitorarAutorDaMensagem(db, m) {
+        let de = m.de;
+        let fonte = { chatId: m.chatId, messageId: m.messageId };
+        if (!de) {
+            const cli = await obterClienteParaFerramentas();
+            const entidade = await encontrarEntidadePorChatId(m.chatId);
+            if (!entidade) throw new Error("a conta nao esta mais nesse grupo");
+            const resposta = await chamarComPausaLocal(
+                () =>
+                    cli.invoke(
+                        entidade.className === "Channel"
+                            ? new Api.channels.GetMessages({ channel: entidade, id: [new Api.InputMessageID({ id: m.messageId })] })
+                            : new Api.messages.GetMessages({ id: [new Api.InputMessageID({ id: m.messageId })] }),
+                        undefined,
+                        { floodSleepThreshold: 0 }
+                    ),
+                { sinal: null, maximoSegundosDePausa: 60 }
+            );
+            const mensagem = (resposta.messages || []).find((x) => x.id === m.messageId && x.className === "Message");
+            if (!mensagem) throw new Error("mensagem nao existe mais no servidor");
+            de = idDoAutor(mensagem) || (entidade.broadcast ? m.chatId : null);
+            if (!de) throw new Error("o Telegram nao informou o autor");
+            for (const u of [...(resposta.users || []), ...(resposta.chats || [])]) {
+                const idU = u.className === "User" ? String(u.id) : "-100" + String(u.id);
+                if (idU === String(de)) atualizarRemetente(db, idU, u);
+            }
+            const leve = db.indice.get(m.key);
+            if (leve) {
+                db.indice.set(m.key, { ...leve, de });
+                adiarAnexo(db, "indice.jsonl", JSON.stringify({ ...leve, de }) + "\n");
+                await descarregarEscritasPendentes(db);
+            }
+        }
+        const tipo = tipoDoAutor(de, m.chatId);
+        if (tipo === "anonimo") {
+            return m.assinatura
+                ? 'Admin anonimo (assinou "' + m.assinatura + '") - o Telegram nao revela quem e, nao da pra monitorar'
+                : "Mensagem do proprio grupo/canal (admin anonimo ou post do canal) - o Telegram nao revela a pessoa, nao da pra monitorar";
+        }
+        const nova = await adicionarMonitorado(db, { id: de, tipo, fonte });
+        const nome = nomeDoAutor(db, de);
+        if (!nova) return "Ja monitorado: " + nome;
+        return "Monitorando " + nome + (tipo === "canal" ? " (canal que posta como autor)" : "") + " - veja em Monitorados";
+    }
+
+    // ---- caminho servidor ----
+
+    function inputPeerDoChat(entidade) {
+        if (entidade.className === "Channel") return new Api.InputPeerChannel({ channelId: entidade.id, accessHash: entidade.accessHash });
+        if (entidade.className === "Chat") return new Api.InputPeerChat({ chatId: entidade.id });
+        return new Api.InputPeerUser({ userId: entidade.id, accessHash: entidade.accessHash });
+    }
+
+    // Quem e o "from_id" do messages.search. Precisa do access hash da
+    // pessoa: o que veio completo do Telegram (remetentes.json, "h") ou,
+    // sem ele (em grupo grande o Telegram manda a pessoa "min", sem hash
+    // utilizavel), uma mensagem dela que ja esta salva - InputPeerUserFromMessage
+    // diz ao servidor "a pessoa que mandou a mensagem X do chat Y".
+    async function fromIdDaPessoa(db, pessoa, entidadeDoChat, chatId) {
+        const id = String(pessoa.id);
+        const dados = db.remetentes.get(id);
+        const ehCanal = id.startsWith("-");
+        const idPuro = ehCanal ? idBaseDoChatId(id) : id;
+        if (dados && dados.h) {
+            return ehCanal ? new Api.InputPeerChannel({ channelId: idPuro, accessHash: dados.h }) : new Api.InputPeerUser({ userId: idPuro, accessHash: dados.h });
+        }
+        // Uma mensagem dela neste chat (melhor) ou em qualquer chat do scan.
+        let fonte = null;
+        for (const valor of db.indice.values()) {
+            if (valor.de !== id) continue;
+            if (valor.chatId === chatId) {
+                fonte = { chatId, messageId: valor.messageId };
+                break;
+            }
+            if (!fonte) fonte = { chatId: valor.chatId, messageId: valor.messageId };
+        }
+        if (!fonte && pessoa.fonte) fonte = pessoa.fonte;
+        if (!fonte) return null;
+        const entidadeDaFonte = fonte.chatId === chatId ? entidadeDoChat : await encontrarEntidadePorChatId(fonte.chatId);
+        if (!entidadeDaFonte) return null;
+        const peer = inputPeerDoChat(entidadeDaFonte);
+        return ehCanal
+            ? new Api.InputPeerChannelFromMessage({ peer, msgId: fonte.messageId, channelId: idPuro })
+            : new Api.InputPeerUserFromMessage({ peer, msgId: fonte.messageId, userId: idPuro });
+    }
+
+    let verificacaoDosMonitorados = null; // { promessa, controle } - preenchido ANTES do primeiro await
+
+    function verificacaoRodando() {
+        return !!verificacaoDosMonitorados;
+    }
+
+    function pararVerificacaoDosMonitorados() {
+        if (verificacaoDosMonitorados) verificacaoDosMonitorados.controle.abort();
+    }
+
+    // aoProgresso(linhasPorGrupo: Map(rotulo -> texto), resumo)
+    function verificarMonitoradosAgora(db, aoProgresso) {
+        if (verificacaoDosMonitorados) return verificacaoDosMonitorados.promessa;
+        const controle = new AbortController();
+        const execucao = { controle };
+        verificacaoDosMonitorados = execucao;
+        execucao.promessa = (async () => {
+            let batimento = null;
+            let temTrava = false;
+            const linhas = new Map();
+            const avisar = (rotulo, texto, resumo) => {
+                if (rotulo) linhas.set(rotulo, texto);
+                if (aoProgresso) aoProgresso(linhas, resumo);
+            };
+            const resumo = { novas: 0, conferidas: 0, gruposPulados: 0, interrompido: false };
+            try {
+                const estado = await carregarMonitorados(db);
+                const ativas = estado.pessoas.filter((p) => !p.pausado);
+                if (!ativas.length) return resumo;
+                if (!pegarTravaDoServidor("monitorados")) throw erroComMensagem("ja tem um trabalho no servidor rodando (" + descricaoDaTravaDoServidor() + ") - tente quando ele terminar");
+                temTrava = true;
+                batimento = setInterval(() => {
+                    if (!pegarTravaDoServidor("monitorados")) controle.abort();
+                }, VALIDADE_TRAVA_DO_SERVIDOR_MS / 3);
+                const cli = await obterClienteParaFerramentas();
+                const excluidos = carregarGruposExcluidos();
+                const gruposDoScan = listarChats(db)
+                    .map((c) => c.chatId)
+                    .filter((id) => !excluidos.has(id));
+                const maximo = lerPreferencia("mon_maximo_por_grupo");
+                for (const pessoa of ativas) {
+                    const nomePessoa = pessoa.apelido || nomeDoAutor(db, pessoa.id);
+                    const grupos = pessoa.grupos ? pessoa.grupos.filter((g) => gruposDoScan.includes(g) || buscarChat(db, g)) : gruposDoScan;
+                    for (const chatId of grupos) {
+                        if (controle.signal.aborted) throw erroDeCancelado();
+                        const titulo = (buscarChat(db, chatId) || {}).chatTitle || chatId;
+                        const rotulo = nomePessoa + " em " + titulo;
+                        const ctx = {
+                            sinal: controle.signal,
+                            aoPausa: (s) => avisar(rotulo, s ? "Telegram pediu pausa: " + s + "s (continua sozinho)" : "verificando...", resumo),
+                        };
+                        avisar(rotulo, "verificando...", resumo);
+                        const chave = pessoa.id + "|" + chatId;
+                        const anterior = estado.verificacoes[chave] || { ultimoId: 0 };
+                        let entidade = null;
+                        try {
+                            entidade = await chamarComPausaLocal(() => encontrarEntidadePorChatId(chatId), ctx);
+                        } catch (erro) {
+                            if (erro && erro.cancelado) throw erro;
+                        }
+                        if (!entidade) {
+                            resumo.gruposPulados++;
+                            avisar(rotulo, "pulado: a conta nao esta mais nesse grupo", resumo);
+                            continue;
+                        }
+                        const fromId = await fromIdDaPessoa(db, pessoa, entidade, chatId);
+                        if (!fromId) {
+                            resumo.gruposPulados++;
+                            avisar(rotulo, "pulado: falta o 'endereco' da pessoa (nenhuma mensagem dela salva) - rode o scan ou use Monitorar autor numa mensagem dela", resumo);
+                            continue;
+                        }
+                        let offsetId = (anterior.emAndamento && anterior.emAndamento.offsetId) || 0;
+                        let maiorId = Math.max(anterior.ultimoId || 0, (anterior.emAndamento && anterior.emAndamento.maiorId) || 0);
+                        let nestaVez = 0;
+                        let novasNoGrupo = 0;
+                        let terminou = false;
+                        try {
+                            while (nestaVez < maximo) {
+                                const resposta = await chamarComPausaLocal(
+                                    () =>
+                                        cli.invoke(
+                                            new Api.messages.Search({
+                                                peer: entidade,
+                                                q: "",
+                                                fromId,
+                                                filter: new Api.InputMessagesFilterEmpty({}),
+                                                minDate: 0,
+                                                maxDate: 0,
+                                                offsetId,
+                                                addOffset: 0,
+                                                limit: Math.min(100, maximo - nestaVez),
+                                                maxId: 0,
+                                                minId: anterior.ultimoId || 0,
+                                                hash: 0,
+                                            }),
+                                            undefined,
+                                            { floodSleepThreshold: 0 }
+                                        ),
+                                    ctx
+                                );
+                                // Parou no meio: descarta esta pagina (a retomada pede de novo).
+                                if (controle.signal.aborted) throw erroDeCancelado();
+                                const mensagens = (resposta.messages || []).filter((x) => x.className === "Message" && x.id > (anterior.ultimoId || 0));
+                                for (const usuario of [...(resposta.users || []), ...(resposta.chats || [])]) {
+                                    const idU = usuario.className === "User" ? String(usuario.id) : "-100" + String(usuario.id);
+                                    if (idU === String(pessoa.id)) atualizarRemetente(db, idU, usuario);
+                                }
+                                for (const mensagem of mensagens) {
+                                    const registro = montarRegistroDoScan(db, chatId, titulo, mensagem);
+                                    if (!registro.de) registro.de = String(pessoa.id);
+                                    if (!db.indice.has(registro.key)) {
+                                        novasNoGrupo++;
+                                        resumo.novas++;
+                                    }
+                                    await salvarMensagem(db, registro, { adiarGravacao: true });
+                                    maiorId = Math.max(maiorId, mensagem.id);
+                                }
+                                nestaVez += mensagens.length;
+                                resumo.conferidas += mensagens.length;
+                                const pedidas = Math.min(100, maximo - nestaVez + mensagens.length);
+                                if (!mensagens.length || (resposta.messages || []).length < pedidas) {
+                                    terminou = true;
+                                    break;
+                                }
+                                offsetId = mensagens[mensagens.length - 1].id;
+                                // Retomada: guarda onde parou a cada pagina.
+                                estado.verificacoes[chave] = { ...anterior, emAndamento: { offsetId, maiorId } };
+                                await descarregarEscritasPendentes(db);
+                                await salvarMonitorados(db);
+                                avisar(rotulo, nestaVez + " mensagem(ns) conferida(s)...", resumo);
+                            }
+                        } catch (erro) {
+                            if (erro && erro.cancelado) throw erro;
+                            if (!erroSoDesteChat(erro)) throw erro;
+                            resumo.gruposPulados++;
+                            avisar(rotulo, "pulado: " + erro.errorMessage, resumo);
+                            await descarregarEscritasPendentes(db);
+                            continue;
+                        }
+                        await descarregarEscritasPendentes(db);
+                        if (terminou) estado.verificacoes[chave] = { ultimoId: maiorId, verificadoEm: new Date().toISOString(), emAndamento: null };
+                        else estado.verificacoes[chave] = { ...anterior, emAndamento: { offsetId, maiorId } };
+                        await salvarMonitorados(db);
+                        avisar(
+                            rotulo,
+                            terminou
+                                ? novasNoGrupo + " nova(s)" + (nestaVez ? " de " + nestaVez + " conferida(s)" : "")
+                                : novasNoGrupo + " nova(s) - parou no limite de " + maximo + " por vez, continua na proxima verificacao",
+                            resumo
+                        );
+                    }
+                }
+                estado.ultimaVerificacao = new Date().toISOString();
+                await salvarMonitorados(db);
+                return resumo;
+            } catch (erro) {
+                if (erro && erro.cancelado) {
+                    resumo.interrompido = true;
+                    await descarregarEscritasPendentes(db).catch(() => {});
+                    if (db.monitorados) await salvarMonitorados(db).catch(() => {});
+                    return resumo;
+                }
+                throw erro;
+            } finally {
+                if (batimento) clearInterval(batimento);
+                if (temTrava) soltarTravaDoServidor("monitorados");
+                verificacaoDosMonitorados = null;
+            }
+        })();
+        return execucao.promessa;
+    }
+
+    // Verificacao automatica (opcional, desligada por padrao): enquanto a
+    // aba estiver aberta, a cada N minutos - so se a pasta ja estiver
+    // liberada (sem clique nao da pra pedir) e nada pesado estiver rodando.
+    let ultimaTentativaAutomatica = 0;
+    async function verificacaoAutomaticaSePrecisar() {
+        if (!lerPreferencia("mon_auto") || verificacaoDosMonitorados || scanEmAndamento) return false;
+        const intervaloMs = lerPreferencia("mon_auto_minutos") * 60000;
+        if (Date.now() - ultimaTentativaAutomatica < intervaloMs) return false;
+        const pasta = await garantirPastaDeArmazenamento().catch(() => null);
+        if (!pasta) return false;
+        const db = await abrirBanco();
+        const estado = await carregarMonitorados(db);
+        if (!estado.pessoas.some((p) => !p.pausado)) return false;
+        const ultima = estado.ultimaVerificacao ? Date.parse(estado.ultimaVerificacao) : 0;
+        if (Date.now() - ultima < intervaloMs) return false;
+        ultimaTentativaAutomatica = Date.now();
+        await verificarMonitoradosAgora(db, null).catch((erro) => console.warn("[Gestor TLGR] verificacao automatica:", erro));
+        return true;
+    }
+
+    // ---- busca de pessoa pelo nome ----
+
+    // No que o scan ja viu (remetentes.json): nome ou @usuario contendo o
+    // termo. Pra cada candidato, em quais grupos ele tem mensagem salva.
+    function procurarPessoasNoQueFoiEscaneado(db, termo) {
+        const busca = normalizarTexto(termo.replace(/^@/, "")).trim();
+        if (!busca) return [];
+        const candidatos = [];
+        for (const [id, dados] of db.remetentes) {
+            const nomes = [dados.n || "", dados.u || "", ...(dados.a || [])].map(normalizarTexto);
+            if (id === busca || nomes.some((n) => n.includes(busca))) candidatos.push({ id, dados, grupos: new Map() });
+            if (candidatos.length >= 30) break;
+        }
+        if (!candidatos.length) return [];
+        const porId = new Map(candidatos.map((c) => [c.id, c]));
+        for (const valor of db.indice.values()) {
+            const candidato = valor.de && porId.get(valor.de);
+            if (!candidato) continue;
+            candidato.grupos.set(valor.chatId, (candidato.grupos.get(valor.chatId) || 0) + 1);
+        }
+        return candidatos.sort((a, b) => b.grupos.size - a.grupos.size);
+    }
+
+    // No Telegram (contacts.search): acha quem tem @usuario publico ou e
+    // contato. Pra cada um, os grupos em comum (messages.getCommonChats).
+    async function procurarPessoasNoTelegram(termo) {
+        const cli = await obterClienteParaFerramentas();
+        const ctx = { sinal: null, maximoSegundosDePausa: 60 };
+        const resposta = await chamarComPausaLocal(
+            () => cli.invoke(new Api.contacts.Search({ q: termo.replace(/^@/, ""), limit: 10 }), undefined, { floodSleepThreshold: 0 }),
+            ctx
+        );
+        const pessoas = (resposta.users || []).filter((u) => !u.bot && !u.self).slice(0, 6);
+        for (const pessoa of pessoas) {
+            try {
+                const comuns = await chamarComPausaLocal(
+                    () => cli.invoke(new Api.messages.GetCommonChats({ userId: pessoa, maxId: 0, limit: 20 }), undefined, { floodSleepThreshold: 0 }),
+                    ctx
+                );
+                pessoa.gruposEmComum = (comuns.chats || []).map((c) => c.title).filter(Boolean);
+            } catch (erro) {
+                pessoa.gruposEmComum = null;
+            }
+        }
+        return pessoas;
+    }
+
+    // ---- tela ----
+
+    function rotuloDaPessoa(db, pessoa) {
+        const dados = db.remetentes.get(String(pessoa.id)) || {};
+        const nome = dados.n || "(nome ainda desconhecido)";
+        const partes = [pessoa.apelido ? pessoa.apelido + " = " + nome : nome];
+        if (dados.u) partes.push("@" + dados.u);
+        partes.push("id " + pessoa.id);
+        if (pessoa.tipo === "canal") partes.push("canal");
+        return partes.join(" - ");
+    }
+
+    function mensagensDosMonitorados(db, { pessoaId, chatId, limite, excluir }) {
+        const estado = db.monitorados;
+        const ids = new Map(estado.pessoas.filter((p) => !p.pausado && (!pessoaId || String(p.id) === pessoaId)).map((p) => [String(p.id), p]));
+        const selecao = criarSelecaoDosPrimeiros(limite, compararPorData);
+        for (const valor of db.indice.values()) {
+            const pessoa = valor.de && ids.get(valor.de);
+            if (!pessoa || !grupoValeParaPessoa(pessoa, valor.chatId)) continue;
+            if (chatId && valor.chatId !== chatId) continue;
+            if (excluir && excluir.has(valor.key)) continue;
+            selecao.adicionar(valor);
+        }
+        return selecao.resultado();
+    }
+
+    // Botao "excluir" com confirmacao no proprio botao (segundo clique em
+    // ate 4 s), mesmo padrao do "sair" e do "Voltar ao padrao".
+    function botaoExcluirComConfirmacao(container, aoConfirmar) {
+        const botao = botaoPequeno(container, "\u2715 Excluir", null, "color:#ff6b6b;");
+        botao.title = "Excluir (pede confirmacao)";
+        let pendente = null;
+        botao.addEventListener("click", async () => {
+            if (!pendente) {
+                botao.textContent = "Confirmar exclusao?";
+                botao.style.background = "#a33";
+                botao.style.color = "#fff";
+                pendente = setTimeout(() => {
+                    pendente = null;
+                    botao.textContent = "\u2715 Excluir";
+                    botao.style.background = "#2a2f3a";
+                    botao.style.color = "#ff6b6b";
+                }, 4000);
+                return;
+            }
+            clearTimeout(pendente);
+            pendente = null;
+            botao.disabled = true;
+            await aoConfirmar();
+        });
+        return botao;
+    }
+
+    // Linha de quem e monitorado (pessoa ou rastreador) com lapis (editar
+    // ali mesmo) e excluir. campos: [{ rotulo, valor, tipo: "texto"|"caixa" }]
+    function linhaEditavel(container, texto, campos, aoSalvar, aoExcluir) {
+        const linha = document.createElement("div");
+        linha.style.cssText = "padding:6px 0;border-bottom:1px solid #2a2f3a;font-size:12px;";
+        const topo = document.createElement("div");
+        topo.style.cssText = "display:flex;gap:6px;align-items:center;";
+        const rotulo = document.createElement("span");
+        rotulo.style.cssText = "flex:1;min-width:0;";
+        rotulo.textContent = texto;
+        topo.appendChild(rotulo);
+        const editor = document.createElement("div");
+        editor.style.cssText = "display:none;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px;";
+        const lapis = botaoPequeno(topo, "\u270E Editar", () => {
+            editor.style.display = editor.style.display === "none" ? "flex" : "none";
+        });
+        lapis.title = "Editar";
+        botaoExcluirComConfirmacao(topo, aoExcluir);
+        linha.appendChild(topo);
+        const leitores = [];
+        for (const campo of campos) {
+            if (campo.tipo === "caixa") {
+                const caixa = criarQuadradoMarcavel(!!campo.valor, null);
+                editor.appendChild(caixa.elemento);
+                editor.appendChild(Object.assign(document.createElement("span"), { textContent: campo.rotulo }));
+                leitores.push(() => caixa.checked);
+            } else {
+                const entrada = document.createElement("input");
+                entrada.type = "text";
+                entrada.placeholder = campo.rotulo;
+                entrada.value = campo.valor || "";
+                entrada.dataset.campo = campo.rotulo;
+                entrada.style.cssText = ESTILO_CAMPO + "flex:1;min-width:120px;";
+                editor.appendChild(entrada);
+                leitores.push(() => entrada.value.trim());
+            }
+        }
+        botaoPequeno(editor, "Salvar", async () => {
+            await aoSalvar(leitores.map((ler) => ler()));
+        }, "background:#4da3ff;color:#fff;");
+        botaoPequeno(editor, "Cancelar", () => (editor.style.display = "none"));
+        linha.appendChild(editor);
+        container.appendChild(linha);
+        return linha;
+    }
+
+    async function telaMonitorados() {
+        definirTituloTela("Monitorados");
+        const corpo = corpoDoPainel();
+        botaoVoltar(corpo);
+        const db = await abrirBanco();
+        const estado = await carregarMonitorados(db);
+        // "novo" vale ate esta abertura: desenha com o destaque e ja marca
+        // como visto (o numero do botao zera).
+        const novosNestaAbertura = new Set();
+        for (const pessoa of estado.pessoas) for (const key of estado.novos[pessoa.id] || []) novosNestaAbertura.add(key);
+        for (const r of estado.rastreadores) for (const key of r.novos || []) novosNestaAbertura.add(key);
+        if (novosNestaAbertura.size) {
+            estado.novos = {};
+            for (const r of estado.rastreadores) r.novos = [];
+            await salvarMonitorados(db, { zerarNovos: true });
+        } else atualizarContadoresDeNovos(db);
+
+        const explicacao = document.createElement("div");
+        explicacao.style.cssText = "display:flex;align-items:center;gap:4px;color:#8b92a3;margin-bottom:10px;font-size:12px;";
+        explicacao.innerHTML =
+            "<span>Mensagens de quem voce monitora, em todos os grupos do scan. O scan normal ja traz as novas sozinho.</span>" +
+            criarIconeInfoHtml(
+                'A pessoa e guardada pelo ID do Telegram (o nome pode mudar; os anteriores ficam guardados). "Verificar agora" pergunta ao Telegram as mensagens dela em cada grupo do scan desde a ultima verificacao (so o que falta), com pausa automatica se o Telegram pedir. Mensagem de admin anonimo aparece como se fosse do proprio grupo: o Telegram nao revela a pessoa, entao nao da pra monitorar. Canal que posta em grupo como autor pode ser monitorado como "canal". Editar (apelido, pausar) e excluir: lapis e Excluir na lista "Quem voce monitora". Grupos de cada um: Configuracoes > Monitorados.'
+            );
+        corpo.appendChild(explicacao);
+
+        // ---- verificar agora ----
+        const barra = document.createElement("div");
+        barra.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px;";
+        corpo.appendChild(barra);
+        const progresso = document.createElement("div");
+        progresso.style.cssText = "color:#8b92a3;font-size:11px;white-space:pre-line;margin-bottom:8px;max-height:160px;overflow-y:auto;";
+        corpo.appendChild(progresso);
+        const botaoVerificar = botaoPequeno(barra, "Verificar agora no servidor", null, "background:#4da3ff;color:#fff;font-weight:600;");
+        const botaoParar = botaoPequeno(barra, "Parar", () => pararVerificacaoDosMonitorados(), "background:#3a2f2f;");
+        botaoParar.style.display = verificacaoRodando() ? "" : "none";
+        const ultima = document.createElement("span");
+        ultima.style.cssText = "color:#8b92a3;font-size:11px;align-self:center;";
+        ultima.textContent = estado.ultimaVerificacao ? "ultima verificacao: " + new Date(estado.ultimaVerificacao).toLocaleString() : "nunca verificado no servidor";
+        barra.appendChild(ultima);
+        const mostrarProgresso = (linhas, resumo) => {
+            if (!progresso.isConnected && progresso.isConnected !== undefined) return;
+            const texto = [...linhas].map(([rotulo, t]) => rotulo + ": " + t);
+            if (resumo) texto.unshift("Novas ate agora: " + resumo.novas + " | conferidas: " + resumo.conferidas + (resumo.gruposPulados ? " | grupos pulados: " + resumo.gruposPulados : ""));
+            progresso.textContent = texto.join("\n");
+        };
+        botaoVerificar.addEventListener("click", async () => {
+            if (!estado.pessoas.some((p) => !p.pausado)) {
+                progresso.textContent = "Ninguem monitorado (ou todos pausados). Procure uma pessoa abaixo.";
+                return;
+            }
+            botaoVerificar.disabled = true;
+            botaoParar.style.display = "";
+            try {
+                const resumo = await verificarMonitoradosAgora(db, mostrarProgresso);
+                progresso.textContent +=
+                    "\n" + (resumo.interrompido ? "Parado - a proxima verificacao continua de onde parou." : "Verificacao concluida: " + resumo.novas + " mensagem(ns) nova(s).");
+                lista.atualizar(true);
+            } catch (erro) {
+                progresso.textContent += "\nErro: " + mensagemDoErro(erro) + " (o que ja foi conferido ficou salvo; a proxima verificacao continua de onde parou)";
+            } finally {
+                botaoVerificar.disabled = false;
+                botaoParar.style.display = "none";
+            }
+        });
+
+        // ---- quem voce monitora (lapis e excluir na propria lista) ----
+        const tituloPessoas = document.createElement("div");
+        tituloPessoas.style.cssText = "color:#8b92a3;font-weight:600;margin:10px 0 4px;";
+        tituloPessoas.textContent = "Quem voce monitora (" + estado.pessoas.length + ")";
+        corpo.appendChild(tituloPessoas);
+        for (const pessoa of estado.pessoas) {
+            const dados = db.remetentes.get(String(pessoa.id)) || {};
+            linhaEditavel(
+                corpo,
+                (pessoa.pausado ? "(pausado) " : "") + rotuloDaPessoa(db, pessoa) + (dados.a && dados.a.length ? " | antes: " + dados.a.join(", ") : ""),
+                [
+                    { rotulo: "Apelido (opcional)", valor: pessoa.apelido },
+                    { rotulo: "Pausado", valor: pessoa.pausado, tipo: "caixa" },
+                ],
+                async ([apelido, pausado]) => {
+                    await alterarMonitorado(db, pessoa.id, { apelido, pausado });
+                    telaMonitorados();
+                },
+                async () => {
+                    await removerMonitorado(db, pessoa.id);
+                    telaMonitorados();
+                }
+            );
+        }
+
+        // ---- novas no topo, separadas das ja vistas ----
+        const novasNoIndice = [...novosNestaAbertura]
+            .map((key) => db.indice.get(key))
+            .filter(Boolean)
+            .sort(compararPorData);
+        if (novasNoIndice.length) {
+            const tituloNovas = document.createElement("div");
+            tituloNovas.style.cssText = "color:#e0a93a;font-weight:600;margin:14px 0 4px;";
+            tituloNovas.textContent = "Novas desde a ultima vez (" + novasNoIndice.length + ")";
+            corpo.appendChild(tituloNovas);
+            const blocoNovas = document.createElement("div");
+            blocoNovas.className = "trp-monitorados-novas";
+            blocoNovas.style.cssText = "background:rgba(224,169,58,0.08);border-radius:6px;padding:0 6px;";
+            const faltando = [];
+            for (const m of novasNoIndice.slice(0, 200)) {
+                blocoNovas.appendChild(
+                    criarItemDeMensagem(db, m, {
+                        titulo: m.dateUtc.slice(0, 10) + " " + m.dateUtc.slice(11, 16) + (m.reactionTotal ? " - " + m.reactionTotal + " reacoes" : ""),
+                        tamanhoTexto: 200,
+                        faltando,
+                        novo: true,
+                        semMonitorar: true,
+                    })
+                );
+            }
+            corpo.appendChild(blocoNovas);
+            preencherTrechosQueFaltam(db, faltando);
+        }
+        const tituloVistas = document.createElement("div");
+        tituloVistas.style.cssText = "color:#8b92a3;font-weight:600;margin:14px 0 4px;";
+        tituloVistas.textContent = novasNoIndice.length ? "Ja vistas" : "Mensagens";
+        corpo.appendChild(tituloVistas);
+
+        // ---- filtros da lista ----
+        const linhaFiltros = document.createElement("div");
+        linhaFiltros.style.cssText = "display:flex;gap:8px;margin-bottom:8px;";
+        const selectPessoa = document.createElement("select");
+        selectPessoa.style.cssText = ESTILO_CAMPO + "flex:1;min-width:0;";
+        selectPessoa.innerHTML = '<option value="">Todas as pessoas</option>';
+        for (const pessoa of estado.pessoas) {
+            const opcao = document.createElement("option");
+            opcao.value = String(pessoa.id);
+            opcao.textContent = (pessoa.pausado ? "(pausado) " : "") + rotuloDaPessoa(db, pessoa);
+            selectPessoa.appendChild(opcao);
+        }
+        const selectGrupo = document.createElement("select");
+        selectGrupo.style.cssText = ESTILO_CAMPO + "flex:1;min-width:0;";
+        selectGrupo.innerHTML = '<option value="">Todos os grupos</option>';
+        for (const c of listarChats(db).sort((a, b) => (a.chatTitle || "").localeCompare(b.chatTitle || ""))) {
+            const opcao = document.createElement("option");
+            opcao.value = c.chatId;
+            opcao.textContent = c.chatTitle || c.chatId;
+            selectGrupo.appendChild(opcao);
+        }
+        linhaFiltros.appendChild(selectPessoa);
+        linhaFiltros.appendChild(selectGrupo);
+        corpo.appendChild(linhaFiltros);
+
+        const lista = criarListaDeMensagens(corpo, db, {
+            passo: () => lerPreferencia("itens_por_pagina"),
+            ocultarVistos: () => false,
+            vazio: estado.pessoas.length
+                ? 'Nenhuma mensagem salva dessas pessoas ainda. Rode o scan ou "Verificar agora". Mensagens salvas antes da versao 2026.10.14.3 nao tem o autor guardado ate o grupo ser escaneado de novo (o Verificar agora tambem traz).'
+                : "Ninguem monitorado ainda - procure abaixo pelo nome ou use \"Monitorar autor\" numa mensagem de Buscar mensagens.",
+            async buscar(limite) {
+                const mensagens = mensagensDosMonitorados(db, { pessoaId: selectPessoa.value || null, chatId: selectGrupo.value || null, limite, excluir: novosNestaAbertura });
+                return { mensagens, temMais: mensagens.length >= limite };
+            },
+            montarItem: (m, faltando) =>
+                criarItemDeMensagem(db, m, {
+                    titulo: m.dateUtc.slice(0, 10) + " " + m.dateUtc.slice(11, 16) + (m.reactionTotal ? " - " + m.reactionTotal + " reacoes" : ""),
+                    tamanhoTexto: 200,
+                    faltando,
+                    semMonitorar: true,
+                }),
+        });
+        selectPessoa.addEventListener("change", () => lista.atualizar(true));
+        selectGrupo.addEventListener("change", () => lista.atualizar(true));
+
+        // ---- procurar pessoa ----
+        const tituloProcurar = document.createElement("div");
+        tituloProcurar.style.cssText = "color:#8b92a3;font-weight:600;margin:16px 0 6px;";
+        tituloProcurar.textContent = "Monitorar alguem";
+        corpo.appendChild(tituloProcurar);
+        const campoNome = campoTexto(corpo, "Nome, @usuario ou ID", "text");
+        const botoesProcurar = document.createElement("div");
+        botoesProcurar.style.cssText = "display:flex;gap:6px;margin-bottom:6px;";
+        corpo.appendChild(botoesProcurar);
+        const resultadoProcura = document.createElement("div");
+        corpo.appendChild(resultadoProcura);
+        const linhaCandidato = (texto, detalhe, aoMonitorar) => {
+            const linha = document.createElement("div");
+            linha.style.cssText = "display:flex;gap:6px;align-items:flex-start;padding:6px 0;border-bottom:1px solid #2a2f3a;font-size:12px;";
+            const info = document.createElement("div");
+            info.style.cssText = "flex:1;min-width:0;";
+            info.textContent = texto;
+            const sub = document.createElement("div");
+            sub.style.cssText = "color:#8b92a3;font-size:11px;";
+            sub.textContent = detalhe;
+            info.appendChild(sub);
+            linha.appendChild(info);
+            const botao = botaoPequeno(linha, "Monitorar", async () => {
+                botao.disabled = true;
+                try {
+                    botao.textContent = await aoMonitorar();
+                } catch (erro) {
+                    botao.textContent = "Nao deu: " + mensagemDoErro(erro);
+                    botao.disabled = false;
+                }
+            });
+            resultadoProcura.appendChild(linha);
+        };
+        botaoPequeno(botoesProcurar, "Procurar no que foi escaneado", () => {
+            resultadoProcura.innerHTML = "";
+            const candidatos = procurarPessoasNoQueFoiEscaneado(db, campoNome.value);
+            if (!candidatos.length) {
+                resultadoProcura.innerHTML =
+                    '<div style="color:#8b92a3;font-size:12px;">Ninguem com esse nome nas mensagens escaneadas a partir desta versao. Tente "Procurar no Telegram" (acha quem tem @usuario publico).</div>';
+                return;
+            }
+            const aviso = document.createElement("div");
+            aviso.style.cssText = "color:#8b92a3;font-size:11px;margin-bottom:4px;";
+            aviso.textContent = candidatos.length > 1 ? candidatos.length + " pessoas com esse nome - confira o @usuario e os grupos pra escolher a certa:" : "";
+            resultadoProcura.appendChild(aviso);
+            for (const c of candidatos) {
+                const grupos = [...c.grupos.entries()]
+                    .sort((a, b) => b[1] - a[1])
+                    .slice(0, 4)
+                    .map(([chatId, n]) => ((buscarChat(db, chatId) || {}).chatTitle || chatId) + " (" + n + ")");
+                linhaCandidato(
+                    (c.dados.c ? "[canal] " : "") + c.dados.n + (c.dados.u ? " (@" + c.dados.u + ")" : "") + " - id " + c.id + (c.dados.a && c.dados.a.length ? " - antes: " + c.dados.a.join(", ") : ""),
+                    grupos.length ? "Grupos em comum (mensagens salvas): " + grupos.join(", ") : "Sem mensagem salva dele",
+                    async () => {
+                        const nova = await adicionarMonitorado(db, { id: c.id, tipo: c.dados.c ? "canal" : "pessoa" });
+                        return nova ? "Monitorando" : "Ja monitorado";
+                    }
+                );
+            }
+        });
+        botaoPequeno(botoesProcurar, "Procurar no Telegram", async () => {
+            resultadoProcura.innerHTML = '<div style="color:#8b92a3;font-size:12px;">Procurando...</div>';
+            try {
+                const pessoas = await procurarPessoasNoTelegram(campoNome.value.trim());
+                resultadoProcura.innerHTML = "";
+                if (!pessoas.length) {
+                    resultadoProcura.innerHTML = '<div style="color:#8b92a3;font-size:12px;">Ninguem encontrado (o Telegram so acha por nome quem tem @usuario publico ou e seu contato).</div>';
+                    return;
+                }
+                for (const u of pessoas) {
+                    linhaCandidato(
+                        nomeDaEntidade(u) + (u.username ? " (@" + u.username + ")" : "") + " - id " + u.id,
+                        u.gruposEmComum == null ? "Grupos em comum: nao deu pra consultar" : u.gruposEmComum.length ? "Grupos em comum: " + u.gruposEmComum.slice(0, 5).join(", ") : "Nenhum grupo em comum com voce",
+                        async () => {
+                            atualizarRemetente(db, String(u.id), u);
+                            await descarregarEscritasPendentes(db);
+                            const nova = await adicionarMonitorado(db, { id: String(u.id), tipo: "pessoa" });
+                            return nova ? "Monitorando" : "Ja monitorado";
+                        }
+                    );
+                }
+            } catch (erro) {
+                resultadoProcura.innerHTML = "";
+                textoAviso(resultadoProcura, "Erro: " + mensagemDoErro(erro), "#ff6b6b");
+            }
+        });
+
+        // ---- rastreadores de palavra ----
+        montarRastreadores(corpo, db, novosNestaAbertura);
+
+        await lista.atualizar(true);
+    }
+
+    // Mensagens ja salvas com TODAS as palavras do termo (pra criar ou
+    // trocar o termo de um rastreador), mais antiga primeiro.
+    async function achadosDoTermo(db, termo) {
+        const achadas = await buscarTexto(db, { termo, chatId: null, limite: LIMITE_ACHADOS_RASTREADOR, ordenarPor: "data", excluidos: carregarGruposExcluidos() });
+        const palavras = normalizarTexto(termo).split(/\s+/).filter(Boolean);
+        return achadas
+            .filter((m) => palavras.every((p) => normalizarTexto(m.texto || "").includes(p)))
+            .map((m) => m.key)
+            .reverse();
+    }
+
+    function montarRastreadores(corpo, db, novosNestaAbertura) {
+        const estado = db.monitorados;
+        const titulo = document.createElement("div");
+        titulo.style.cssText = "color:#8b92a3;font-weight:600;margin:16px 0 6px;display:flex;align-items:center;gap:4px;";
+        titulo.innerHTML =
+            "<span>Rastreadores de palavra</span>" +
+            criarIconeInfoHtml(
+                "Avisa (no mesmo contador) quando o scan salvar mensagem nova com TODAS as palavras do termo, sem acento e sem diferenca de maiuscula. Ao criar, ja procura no que esta salvo. Grupos de cada rastreador: Configuracoes > Monitorados."
+            );
+        corpo.appendChild(titulo);
+        const campo = campoTexto(corpo, "Palavra ou frase", "text");
+        const botao = botaoPequeno(corpo, "Criar rastreador", async () => {
+            const termo = campo.value.trim();
+            if (!termo) return;
+            botao.disabled = true;
+            botao.textContent = "Procurando no que esta salvo...";
+            const achados = await achadosDoTermo(db, termo);
+            await alterarRastreadores(db, (e) => e.rastreadores.push({ id: Date.now().toString(36), termo, grupos: null, pausado: false, achados, novos: [], criadoEm: new Date().toISOString() }));
+            telaMonitorados();
+        });
+        for (const r of estado.rastreadores) {
+            const bloco = document.createElement("div");
+            bloco.style.cssText = "border-top:1px solid #2a2f3a;padding:6px 0;font-size:12px;";
+            linhaEditavel(
+                bloco,
+                'Rastreador "' + r.termo + '"' + (r.pausado ? " (pausado)" : ""),
+                [
+                    { rotulo: "Palavra ou frase", valor: r.termo },
+                    { rotulo: "Pausado", valor: r.pausado, tipo: "caixa" },
+                ],
+                async ([termo, pausado]) => {
+                    if (!termo) return;
+                    // Termo mudou: procura de novo no que esta salvo.
+                    const achados = termo === r.termo ? null : await achadosDoTermo(db, termo);
+                    await alterarRastreadores(db, (e) => {
+                        const atual = e.rastreadores.find((x) => x.id === r.id);
+                        if (!atual) return;
+                        atual.pausado = pausado;
+                        if (achados) {
+                            atual.termo = termo;
+                            atual.achados = achados;
+                            atual.novos = [];
+                        }
+                    });
+                    telaMonitorados();
+                },
+                async () => {
+                    await alterarRastreadores(db, (e) => (e.rastreadores = e.rastreadores.filter((x) => x.id !== r.id)));
+                    telaMonitorados();
+                }
+            );
+            const cabecalho = document.createElement("div");
+            cabecalho.style.cssText = "cursor:pointer;color:#e6e8ec;";
+            const quantosNovos = (r.achados || []).filter((k) => novosNestaAbertura.has(k)).length;
+            cabecalho.textContent = "▸ \"" + r.termo + "\" - " + (r.achados || []).length + " mensagem(ns)" + (quantosNovos ? ", " + quantosNovos + " nova(s)" : "") + (r.pausado ? " (pausado)" : "");
+            const itens = document.createElement("div");
+            itens.style.display = "none";
+            cabecalho.addEventListener("click", () => {
+                const abrir = itens.style.display === "none";
+                itens.style.display = abrir ? "block" : "none";
+                if (abrir && !itens.childNodes.length) {
+                    const faltando = [];
+                    const mensagens = (r.achados || [])
+                        .map((k) => db.indice.get(k))
+                        .filter(Boolean)
+                        .sort(compararPorData)
+                        .slice(0, 100);
+                    if (!mensagens.length) itens.textContent = "Nenhuma mensagem ainda.";
+                    for (const m of mensagens) {
+                        itens.appendChild(criarItemDeMensagem(db, m, { titulo: m.dateUtc.slice(0, 10) + " - " + (m.chatTitle || m.chatId), tamanhoTexto: 200, faltando, novo: novosNestaAbertura.has(m.key) }));
+                    }
+                    preencherTrechosQueFaltam(db, faltando);
+                }
+            });
+            bloco.appendChild(cabecalho);
+            bloco.appendChild(itens);
+            corpo.appendChild(bloco);
+        }
+    }
+
+    // Configuracoes > Monitorados: pausar, remover, apelido e grupos de cada
+    // pessoa e de cada rastreador.
+    async function montarConfiguracaoDosMonitorados(corpo, db) {
+        const estado = await carregarMonitorados(db);
+        const chats = listarChats(db).sort((a, b) => (a.chatTitle || "").localeCompare(b.chatTitle || ""));
+        const editor = (item, rotulo, aoMudar, aoRemover, comApelido) => {
+            const bloco = document.createElement("div");
+            bloco.style.cssText = "border:1px solid #2a2f3a;border-radius:6px;padding:8px;margin-bottom:8px;font-size:12px;";
+            const cabecalho = document.createElement("div");
+            cabecalho.style.cssText = "color:#e6e8ec;margin-bottom:6px;";
+            cabecalho.textContent = rotulo;
+            bloco.appendChild(cabecalho);
+            const linha = document.createElement("div");
+            linha.style.cssText = "display:flex;gap:8px;align-items:center;flex-wrap:wrap;";
+            const pausar = criarQuadradoMarcavel(!!item.pausado, (marcado) => aoMudar({ pausado: marcado }));
+            linha.appendChild(pausar.elemento);
+            linha.appendChild(Object.assign(document.createElement("span"), { textContent: "Pausado" }));
+            if (comApelido) {
+                const apelido = document.createElement("input");
+                apelido.placeholder = "Apelido (opcional)";
+                apelido.value = item.apelido || "";
+                apelido.style.cssText = ESTILO_CAMPO + "flex:1;min-width:120px;";
+                apelido.addEventListener("change", () => aoMudar({ apelido: apelido.value.trim() }));
+                linha.appendChild(apelido);
+            }
+            botaoPequeno(linha, "Remover", aoRemover, "color:#ff6b6b;");
+            bloco.appendChild(linha);
+            const grupos = document.createElement("details");
+            grupos.style.cssText = "margin-top:6px;color:#8b92a3;";
+            const resumo = document.createElement("summary");
+            resumo.textContent = item.grupos ? "Grupos: " + item.grupos.length + " escolhido(s)" : "Grupos: todos os do scan";
+            grupos.appendChild(resumo);
+            const todos = criarQuadradoMarcavel(!item.grupos, (marcado) => {
+                aoMudar({ grupos: marcado ? null : chats.map((c) => c.chatId) });
+                montarConfiguracoesDeNovo();
+            });
+            const linhaTodos = document.createElement("div");
+            linhaTodos.style.cssText = "display:flex;gap:6px;align-items:center;margin:4px 0;";
+            linhaTodos.appendChild(todos.elemento);
+            linhaTodos.appendChild(Object.assign(document.createElement("span"), { textContent: "Todos os grupos do scan (inclui os novos)" }));
+            grupos.appendChild(linhaTodos);
+            if (item.grupos) {
+                for (const c of chats) {
+                    const linhaGrupo = document.createElement("div");
+                    linhaGrupo.style.cssText = "display:flex;gap:6px;align-items:center;margin:2px 0 2px 16px;";
+                    const caixa = criarQuadradoMarcavel(item.grupos.includes(c.chatId), (marcado) => {
+                        const atuais = new Set(item.grupos || []);
+                        if (marcado) atuais.add(c.chatId);
+                        else atuais.delete(c.chatId);
+                        aoMudar({ grupos: [...atuais] });
+                    });
+                    linhaGrupo.appendChild(caixa.elemento);
+                    linhaGrupo.appendChild(Object.assign(document.createElement("span"), { textContent: c.chatTitle || c.chatId }));
+                    grupos.appendChild(linhaGrupo);
+                }
+            }
+            bloco.appendChild(grupos);
+            corpo.appendChild(bloco);
+        };
+        const montarConfiguracoesDeNovo = () => telaConfiguracoes("monitorados");
+        if (!estado.pessoas.length) {
+            const vazio = document.createElement("div");
+            vazio.style.cssText = "color:#8b92a3;font-size:12px;margin-bottom:8px;";
+            vazio.textContent = "Ninguem monitorado ainda (adicione pela tela Monitorados ou pelo botao Monitorar autor nas buscas).";
+            corpo.appendChild(vazio);
+        }
+        for (const pessoa of estado.pessoas) {
+            const dados = db.remetentes.get(String(pessoa.id)) || {};
+            editor(
+                pessoa,
+                rotuloDaPessoa(db, pessoa) + (dados.a && dados.a.length ? " | nomes anteriores: " + dados.a.join(", ") : ""),
+                (mudancas) => alterarMonitorado(db, pessoa.id, mudancas),
+                async () => {
+                    await removerMonitorado(db, pessoa.id);
+                    montarConfiguracoesDeNovo();
+                },
+                true
+            );
+        }
+        for (const r of estado.rastreadores) {
+            editor(
+                r,
+                'Rastreador "' + r.termo + '" - ' + (r.achados || []).length + " mensagem(ns)",
+                (mudancas) =>
+                    alterarRastreadores(db, (e) => {
+                        const atual = e.rastreadores.find((x) => x.id === r.id);
+                        if (atual) Object.assign(atual, mudancas);
+                    }),
+                async () => {
+                    await alterarRastreadores(db, (e) => (e.rastreadores = e.rastreadores.filter((x) => x.id !== r.id)));
+                    montarConfiguracoesDeNovo();
+                },
+                false
+            );
+        }
+    }
+
+    try {
+        // Numero salvo no botao flutuante logo ao carregar (sem abrir a pasta).
+        setTimeout(() => atualizarContadoresDeNovos(null), 0);
+        // Verificacao automatica: confere a cada minuto se e hora (desligada por padrao).
+        setInterval(() => {
+            verificacaoAutomaticaSePrecisar().catch((erro) => console.warn("[Gestor TLGR] monitorados:", erro));
+        }, 60000);
+    } catch (erro) {
+        console.warn("[Gestor TLGR] monitorados nao iniciou:", erro);
+    }
+    // ==== Fim dos Monitorados ====
+
+    // ==== Tela Configuracoes (rodada 4) ====
+    //
+    // Junta num lugar so tudo que e preferencia: liga/desliga das
+    // ferramentas (antes no fim do menu), listas, Busca avancada, grupos do
+    // scan, pasta de dados, downloads, Monitorados e historico de buscas.
+    // Cada secao tem "Voltar ao padrao". Tudo que se marca aqui (e nas
+    // proprias telas) fica guardado - ver preferencias.js.
+
+    function tituloDeSecao(corpo, texto, id) {
+        const titulo = document.createElement("div");
+        titulo.style.cssText = "color:#4da3ff;font-weight:600;margin:18px 0 8px;border-top:1px solid #2a2f3a;padding-top:10px;";
+        titulo.textContent = texto;
+        if (id) titulo.id = "trp-config-" + id;
+        corpo.appendChild(titulo);
+        return titulo;
+    }
+
+    // Um controle por preferencia visivel da secao: caixinha (sim/nao),
+    // numero ou lista de opcoes.
+    function controlesDaSecao(corpo, secao) {
+        for (const definicao of preferenciasDaSecao(secao)) {
+            if (!definicao.naTelaDeConfig) continue;
+            if (definicao.tipo === "booleano") {
+                linhaDeQuadrado(corpo, definicao.nome, definicao.rotulo);
+                continue;
+            }
+            const bloco = document.createElement("div");
+            bloco.style.cssText = "margin-bottom:10px;font-size:12px;";
+            const rotulo = document.createElement("label");
+            rotulo.style.cssText = "display:block;color:#8b92a3;margin-bottom:3px;";
+            rotulo.textContent = definicao.rotulo;
+            bloco.appendChild(rotulo);
+            let campo;
+            if (definicao.opcoes) {
+                campo = document.createElement("select");
+                for (const opcao of definicao.opcoes) {
+                    const elemento = document.createElement("option");
+                    elemento.value = opcao.valor;
+                    elemento.textContent = opcao.rotulo || opcao.valor;
+                    campo.appendChild(elemento);
+                }
+            } else {
+                campo = document.createElement("input");
+                campo.type = definicao.tipo === "numero" ? "number" : "text";
+                if (definicao.min != null) campo.min = String(definicao.min);
+                if (definicao.max != null) campo.max = String(definicao.max);
+            }
+            campo.style.cssText = ESTILO_CAMPO + (definicao.tipo === "numero" ? "width:110px;" : "width:100%;");
+            campo.dataset.preferencia = definicao.nome;
+            ligarCampoAPreferencia(campo, definicao.nome);
+            // Numero fora do limite: grava o valor corrigido e mostra ele.
+            campo.addEventListener("change", () => {
+                campo.value = String(lerPreferencia(definicao.nome));
+            });
+            bloco.appendChild(campo);
+            corpo.appendChild(bloco);
+        }
+    }
+
+    function botaoVoltarAoPadrao(corpo, secao, reabrirEm) {
+        const botao = botaoPequeno(corpo, "Voltar ao padrao", () => {
+            if (!botao.dataset.confirmar) {
+                botao.dataset.confirmar = "1";
+                botao.textContent = "Clique de novo pra confirmar";
+                setTimeout(() => {
+                    botao.dataset.confirmar = "";
+                    botao.textContent = "Voltar ao padrao";
+                }, 4000);
+                return;
+            }
+            voltarSecaoAoPadrao(secao);
+            telaConfiguracoes(reabrirEm || secao);
+        });
+        botao.style.marginBottom = "6px";
+        return botao;
+    }
+
+    // Ferramentas: as linhas que cada ferramenta registra
+    // (linhasDoMenuFerramentas) com caixinha + "i".
+    function montarLigaDesligaDasFerramentas(corpo) {
+        for (const definicao of linhasDoMenuFerramentas) {
+            const bloco = document.createElement("div");
+            bloco.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:12px;";
+            const caixa = criarQuadradoMarcavel(definicao.ligada(), (marcado) => definicao.ligar(marcado));
+            const rotulo = document.createElement("span");
+            rotulo.style.cssText = "color:#8b92a3;display:flex;align-items:center;gap:4px;";
+            rotulo.innerHTML = "<span>" + escapeHtml(definicao.rotulo) + "</span>" + criarIconeInfoHtml(definicao.info);
+            bloco.appendChild(caixa.elemento);
+            bloco.appendChild(rotulo);
+            corpo.appendChild(bloco);
+        }
+    }
+    aoVoltarSecaoAoPadrao.push((secao) => {
+        if (secao !== "ferramentas") return;
+        for (const definicao of linhasDoMenuFerramentas) definicao.ligar(!!definicao.padrao);
+    });
+
+    async function telaConfiguracoes(irParaSecao) {
+        definirTituloTela("Configuracoes");
+        const corpo = corpoDoPainel();
+        botaoVoltar(corpo);
+        const db = await abrirBanco();
+
+        const atalhos = document.createElement("div");
+        atalhos.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;font-size:11px;";
+        corpo.appendChild(atalhos);
+        const secoes = [
+            ["ferramentas", "Ferramentas"],
+            ["listas", "Listas"],
+            ["busca_avancada", "Busca avancada"],
+            ["scan", "Scan e grupos"],
+            ["pasta", "Pasta de dados"],
+            ["downloads", "Downloads"],
+            ["monitorados", "Monitorados"],
+            ["historico", "Historico de buscas"],
+        ];
+        for (const [id, rotulo] of secoes) {
+            botaoPequeno(atalhos, rotulo, () => {
+                const alvo = corpo.querySelector && corpo.querySelector("#trp-config-" + id);
+                if (alvo && alvo.scrollIntoView) alvo.scrollIntoView({ block: "start" });
+            });
+        }
+
+        // 1. Ferramentas
+        tituloDeSecao(corpo, "Ferramentas em segundo plano (ligar/desligar)", "ferramentas");
+        montarLigaDesligaDasFerramentas(corpo);
+        botaoVoltarAoPadrao(corpo, "ferramentas");
+
+        // 2. Listas
+        tituloDeSecao(corpo, "Listas e buscas", "listas");
+        const notaListas = document.createElement("div");
+        notaListas.style.cssText = "color:#8b92a3;font-size:11px;margin-bottom:8px;";
+        notaListas.textContent =
+            "Grupo, periodo, reacao e tipo de midia de cada tela tambem ficam guardados como voce deixou (cada tela tem \"Limpar filtros\"). \"Voltar ao padrao\" aqui limpa tudo isso tambem.";
+        corpo.appendChild(notaListas);
+        controlesDaSecao(corpo, "listas");
+        botaoVoltarAoPadrao(corpo, "listas");
+
+        // 3. Busca avancada
+        tituloDeSecao(corpo, "Busca avancada", "busca_avancada");
+        controlesDaSecao(corpo, "busca_avancada");
+        botaoVoltarAoPadrao(corpo, "busca_avancada");
+
+        // 4. Scan e grupos
+        tituloDeSecao(corpo, "Scan e grupos", "scan");
+        const notaScan = document.createElement("div");
+        notaScan.style.cssText = "color:#8b92a3;font-size:11px;margin-bottom:8px;";
+        notaScan.textContent =
+            'O grupo escolhido na tela Escanear e os filtros do Download em lote ficam guardados. "Reescanear do zero" continua valendo so uma vez (de proposito: deixar marcado reescanearia tudo sem querer).';
+        corpo.appendChild(notaScan);
+        const botaoGrupos = botaoAcao(corpo, "Configurar grupos do scan (incluir/excluir)");
+        botaoGrupos.style.background = "#2a2f3a";
+        botaoGrupos.addEventListener("click", () => telaConfigurarGrupos());
+        botaoVoltarAoPadrao(corpo, "scan");
+
+        // 5. Pasta de dados
+        tituloDeSecao(corpo, "Pasta de dados", "pasta");
+        const infoPasta = document.createElement("div");
+        infoPasta.style.cssText = "font-size:12px;margin-bottom:8px;";
+        infoPasta.textContent = "Pasta atual: " + (pastaDeArmazenamento ? pastaDeArmazenamento.name : "(nenhuma)");
+        corpo.appendChild(infoPasta);
+        const notaPasta = document.createElement("div");
+        notaPasta.style.cssText = "color:#8b92a3;font-size:11px;margin-bottom:8px;";
+        notaPasta.textContent =
+            "Trocar de pasta NAO copia nada: antes, feche o scan/lote, copie o conteudo da pasta atual (pelo Explorer) pra nova e so entao escolha a nova aqui. Se escolher uma pasta vazia, o painel comeca do zero nela (a antiga fica intacta).";
+        corpo.appendChild(notaPasta);
+        const botaoTrocarPasta = botaoPequeno(corpo, "Trocar pasta de dados...", async () => {
+            if (scanEmAndamento || (typeof loteEmExecucao !== "undefined" && loteEmExecucao) || verificacaoRodando()) {
+                infoPasta.textContent = "Tem scan, lote ou verificacao rodando - espere terminar (ou pare) antes de trocar a pasta.";
+                infoPasta.style.color = "#ff6b6b";
+                return;
+            }
+            try {
+                await descarregarEscritasPendentes(db);
+                await escolherPastaDeArmazenamento();
+                pastaParaDownloads = null;
+                monitoradosDoBanco = null;
+                telaConfiguracoes("pasta");
+            } catch (erro) {
+                if (erro && erro.name === "AbortError") return;
+                infoPasta.textContent = "Nao deu pra trocar: " + mensagemDoErro(erro);
+                infoPasta.style.color = "#ff6b6b";
+            }
+        });
+        botaoTrocarPasta.style.marginBottom = "6px";
+
+        // 6. Downloads
+        tituloDeSecao(corpo, "Downloads", "downloads");
+        await carregarPastaDeDownloadsSeparada();
+        const infoDownloads = document.createElement("div");
+        infoDownloads.style.cssText = "font-size:12px;margin-bottom:8px;";
+        infoDownloads.textContent = pastaDeDownloadsSeparada
+            ? "Arquivos baixados vao pra pasta escolhida: " + pastaDeDownloadsSeparada.name
+            : "Arquivos baixados vao pra " + PASTA_DOWNLOADS + " dentro da pasta de dados (padrao).";
+        corpo.appendChild(infoDownloads);
+        const linhaPastaDownloads = document.createElement("div");
+        linhaPastaDownloads.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;";
+        corpo.appendChild(linhaPastaDownloads);
+        botaoPequeno(linhaPastaDownloads, "Escolher outra pasta pros arquivos...", async () => {
+            try {
+                await escolherPastaDeDownloads();
+                telaConfiguracoes("downloads");
+            } catch (erro) {
+                if (erro && erro.name === "AbortError") return;
+                infoDownloads.textContent = "Nao deu: " + mensagemDoErro(erro);
+            }
+        });
+        if (pastaDeDownloadsSeparada) {
+            botaoPequeno(linhaPastaDownloads, "Voltar pra Downloads_TLGR da pasta de dados", async () => {
+                await voltarPastaDeDownloadsAoPadrao();
+                telaConfiguracoes("downloads");
+            });
+        }
+        botaoPequeno(linhaPastaDownloads, "Abrir a tela Downloads", () => telaDownloads());
+        controlesDaSecao(corpo, "downloads");
+        const conferencia = document.createElement("div");
+        conferencia.style.cssText = "color:#8b92a3;font-size:11px;margin-bottom:8px;";
+        const atualizarConferencia = () => {
+            const base = lerPreferencia("dl_caminho_base");
+            const nome = pastaDeArmazenamento ? pastaDeArmazenamento.name : "";
+            const confere = !nome || base.replace(/[\\/]+$/, "").split(/[\\/]/).pop().toLowerCase() === nome.toLowerCase();
+            conferencia.textContent =
+                "Exemplo do Copiar caminho: " +
+                caminhoNoWindows({ base: "dados", relativo: PASTA_DOWNLOADS + "/video.mp4" }) +
+                (confere ? "" : '  -  ATENCAO: o caminho termina diferente do nome da pasta de dados ("' + nome + '"). Confira.');
+            conferencia.style.color = confere ? "#8b92a3" : "#e0a93a";
+        };
+        atualizarConferencia();
+        const campoBase = corpo.querySelector ? corpo.querySelector('[data-preferencia="dl_caminho_base"]') : null;
+        if (campoBase) campoBase.addEventListener("change", atualizarConferencia);
+        corpo.appendChild(conferencia);
+        botaoVoltarAoPadrao(corpo, "downloads");
+
+        // 7. Monitorados
+        tituloDeSecao(corpo, "Monitorados", "monitorados");
+        controlesDaSecao(corpo, "monitorados");
+        await montarConfiguracaoDosMonitorados(corpo, db);
+        botaoVoltarAoPadrao(corpo, "monitorados");
+
+        // 8. Historico de buscas
+        tituloDeSecao(corpo, "Historico de buscas", "historico");
+        const botaoHistorico = botaoAcao(corpo, "Historico de buscas (gerenciar/limpar)");
+        botaoHistorico.style.background = "#2a2f3a";
+        botaoHistorico.addEventListener("click", () => telaHistoricoBusca());
+
+        if (irParaSecao) {
+            const alvo = corpo.querySelector && corpo.querySelector("#trp-config-" + irParaSecao);
+            if (alvo && alvo.scrollIntoView) alvo.scrollIntoView({ block: "start" });
+        }
+    }
+    // ==== Fim da tela Configuracoes ====
+
 
     criarBotao();
 })();
