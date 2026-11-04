@@ -4,7 +4,7 @@
 // @name:pt-BR   TLGMaster
 // @name:en      TLGMaster
 // @namespace    telegram-top-reacoes
-// @version      2026.11.03.1
+// @version      2026.11.03.2
 // @description  Login e scanner de reacoes, busca de grupos/canais e mais, tudo direto dentro do Telegram Web, sem servidor local - cliente MTProto rodando em JS puro no proprio navegador
 // @match        https://web.telegram.org/*
 // @grant        GM_setValue
@@ -12,12 +12,15 @@
 // @grant        GM_deleteValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_openInTab
+// @grant        GM_download
 // @connect       raw.githubusercontent.com
 // @connect       erome-indice.tlgmaster.workers.dev
+// @connect       erome.com
+// @connect       www.erome.com
 // @run-at       document-idle
 // @updateURL    https://raw.githubusercontent.com/lohrangm/TLGR-TR-painel/main/painel_telegram.user.js
 // @downloadURL  https://raw.githubusercontent.com/lohrangm/TLGR-TR-painel/main/painel_telegram.user.js
-// @require      https://raw.githubusercontent.com/lohrangm/TLGR-TR-painel/main/principal/painel_principal-2026.11.03.1.js#sha256=9ddb27e50a5b4fa2acd269c6b4610842d5d0a55edd6a42fdac5eaee9b99f1488
+// @require      https://raw.githubusercontent.com/lohrangm/TLGR-TR-painel/main/principal/painel_principal-2026.11.03.2.js#sha256=8b65eaf02856225810d40ec945af4246b75921f9d30f87ecdbfb7c2aae1248b5
 // ==/UserScript==
 
 // Arquivo gerado automaticamente por montar_userscript.mjs - nao editar.
@@ -29,7 +32,7 @@
 // principal vem pelo @require acima e ja rodou antes desta parte.
 (function () {
     "use strict";
-    var VERSAO_DO_CARREGADOR = "2026.11.03.1";
+    var VERSAO_DO_CARREGADOR = "2026.11.03.2";
     var carregada = typeof window.TRP_VERSAO === "string" ? window.TRP_VERSAO : null;
     if (carregada === VERSAO_DO_CARREGADOR) return;
     var texto = carregada
